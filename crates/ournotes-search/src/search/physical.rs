@@ -25,6 +25,12 @@ use leaf::Leaf;
 #[path = "certified_engine.rs"]
 mod certified_engine;
 use certified_engine::CertifiedState;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn needs_certified_frontier(built: &BuiltProblem<'_>) -> Result<bool, Error> {
+    Ok(certified_engine::lottery_mode(built.pool(), &built.context.request, built.domain())?
+        == certified_engine::LotteryMode::Certified)
+}
 #[path = "deck_payoff_search.rs"]
 mod deck_payoff_search;
 #[path = "program_cache.rs"]

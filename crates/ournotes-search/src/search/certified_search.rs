@@ -582,6 +582,61 @@ pub fn evaluate_luck_context(
     aggregate_orders(orders, map).map(Some)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn evaluate_luck_context_parallel(
+    master: &ournotes_sim::master::Master,
+    skills: &ournotes_sim::live::full::LuckSkills,
+    input: &super::expectation::FiniteSeedContext,
+    map: &PayoffMap,
+    caches: &mut [ournotes_sim::live::full::LuckDpCache],
+) -> Result<Option<CertifiedEvaluation>, Error> {
+    let setup = input.gekisou.as_ref().ok_or_else(|| invalid("LUCK requires Gekisou context"))?;
+    let mut states: Vec<_> = caches
+        .iter_mut()
+        .map(|cache| {
+            (
+                cache,
+                ournotes_sim::live::full::LuckScoreSession::new(
+                    master,
+                    skills,
+                    &input.notes,
+                    &input.events,
+                    input.params,
+                    setup,
+                    &input.play,
+                    &input.delta_times,
+                    input.rank_confirmations.as_deref(),
+                ),
+            )
+        })
+        .collect();
+    let orders = uniform::all_orders();
+    let cancelled = crate::parallel::cancellation_check();
+    let result = crate::native_jobs::map(&mut states, &orders, &cancelled, |(cache, session), order| {
+        let performers = order.map(|slot| input.performers[slot].clone());
+        let Some(summary) = session.summary(&performers, Some(&mut **cache), &cancelled)? else {
+            return Ok(None);
+        };
+        let support = (summary.final_support.lower, summary.final_support.upper);
+        let mean = F64Interval::new(summary.final_mean.lower, summary.final_mean.upper)?
+            .intersect(F64Interval::new(support.0 as f64, support.1 as f64)?)
+            .ok_or_else(|| invalid("LUCK mean and support disagree"))?;
+        Ok(Some(OrderScoreInterval {
+            order: *order,
+            mean,
+            support,
+            exact_mean: summary.exact_constant_score.map(|s| fraction(s as i128)),
+            final_life: summary.exact_final_life.map(|life| (life, life)),
+            tails: BTreeMap::new(),
+            refined_payoff: None,
+        }))
+    })?;
+    match result.and_then(|orders| orders.into_iter().collect::<Option<Vec<_>>>()) {
+        Some(orders) => aggregate_orders(orders, map).map(Some),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

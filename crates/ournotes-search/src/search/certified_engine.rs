@@ -110,6 +110,8 @@ pub(super) struct CertifiedState {
     luck_skills: Option<std::sync::Arc<ournotes_sim::live::full::LuckSkills>>,
     /// Certified lottery curves of this request, shared by every performance order and team.
     pub(super) luck_curves: ournotes_sim::live::full::LuckDpCache,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) parallel_curves: Vec<ournotes_sim::live::full::LuckDpCache>,
 }
 
 /// Key bytes the request's lottery-curve cache may hold.
@@ -126,6 +128,15 @@ impl CertifiedState {
             retain_refinement: None,
             luck_skills: None,
             luck_curves: ournotes_sim::live::full::LuckDpCache::new(curve_bytes),
+            #[cfg(not(target_arch = "wasm32"))]
+            parallel_curves: {
+                let n = crate::parallel::simulation_workers();
+                if n > 1 {
+                    (0..n).map(|_| ournotes_sim::live::full::LuckDpCache::new(curve_bytes / n)).collect()
+                } else {
+                    Vec::new()
+                }
+            },
         })
     }
     pub(super) fn contains(&self, p: &PhysicalDeck) -> bool {
@@ -381,13 +392,21 @@ impl Engine<'_, '_> {
                 input.rank_confirmations.as_deref(),
                 self.limits.cache_entries.min(64),
             )?;
-            for (index, _) in priorities {
-                if attempted.contains(&(id, index)) {
+            let indices: Vec<_> = priorities.into_iter().map(|(index, _)| index).collect();
+            let mut prefetched = BTreeMap::new();
+            #[cfg(not(target_arch = "wasm32"))]
+            let workers = crate::parallel::simulation_workers();
+            #[cfg(target_arch = "wasm32")]
+            let workers = 1;
+            for (_offset, &index) in indices.iter().enumerate() {
+                if attempted.contains(&(id, index)) && !prefetched.contains_key(&index) {
                     continue;
                 }
                 let state = self.certified.as_ref().expect("certified request");
                 let proof = state.frontier.proof(RemainingDomain::Exhausted)?;
-                let Some(proof) = pending_refinement(proof, || self.expired()) else {
+                let Some(proof) =
+                    pending_refinement(proof, || self.expired() || (work.exhausted() && prefetched.is_empty()))
+                else {
                     return Ok(());
                 };
                 if !proof.ambiguous.contains(&id) {
@@ -396,19 +415,57 @@ impl Engine<'_, '_> {
                 let state = self.certified.as_ref().expect("certified request");
                 let order =
                     state.entries[&id].refinement.as_ref().expect("admitted candidate").evaluation.orders[index].order;
-                attempted.insert((id, index));
-                let performers = order.map(|slot| input.performers[slot].clone());
-                self.tel.lottery_refinement.attempted_orders += 1;
-                let (_, resume) = self.rec.clock.lap(slot::SIMULATION);
-                let result = session.law(&performers, &mut work, || self.expired());
-                self.rec.clock.lap(resume);
-                let result = result?;
+                #[cfg(not(target_arch = "wasm32"))]
+                if workers > 1 && prefetched.is_empty() {
+                    let batch_indices = &indices[_offset..(_offset + workers).min(indices.len())];
+                    let state = self.certified.as_ref().expect("certified request");
+                    let retained = &state.entries[&id].refinement.as_ref().expect("admitted candidate").evaluation;
+                    let orders: Vec<_> = batch_indices.iter().map(|&i| retained.orders[i].order).collect();
+                    let (_, resume) = self.rec.clock.lap(slot::SIMULATION);
+                    let result = exact_batch(self.pool.master, &input, &orders, &mut work);
+                    self.rec.clock.lap(resume);
+                    let Some(results) = result? else {
+                        self.expired();
+                        return Ok(());
+                    };
+                    for (&i, result) in batch_indices.iter().zip(results) {
+                        attempted.insert((id, i));
+                        let t = &mut self.tel.lottery_refinement;
+                        t.attempted_orders += 1;
+                        t.replay_runs += result.stats.replay_runs;
+                        t.frames += result.stats.frames;
+                        t.terminal_paths += result.stats.terminal_paths;
+                        if result.law.is_some() {
+                            t.completed_orders += 1;
+                        } else {
+                            t.declined_orders += 1;
+                        }
+                        prefetched.insert(i, result);
+                    }
+                }
+                // Already-computed orders are installed in serial order. Proof checks
+                // above remain authoritative and may discard speculative results.
+                let result = if workers > 1 {
+                    prefetched.remove(&index).expect("order included in batch")
+                } else {
+                    attempted.insert((id, index));
+                    let performers = order.map(|slot| input.performers[slot].clone());
+                    self.tel.lottery_refinement.attempted_orders += 1;
+                    let (_, resume) = self.rec.clock.lap(slot::SIMULATION);
+                    let result = session.law(&performers, &mut work, || self.expired());
+                    self.rec.clock.lap(resume);
+                    let result = result?;
+                    let t = &mut self.tel.lottery_refinement;
+                    t.replay_runs += result.stats.replay_runs;
+                    t.frames += result.stats.frames;
+                    t.terminal_paths += result.stats.terminal_paths;
+                    result
+                };
                 let telemetry = &mut self.tel.lottery_refinement;
-                telemetry.replay_runs += result.stats.replay_runs;
-                telemetry.frames += result.stats.frames;
-                telemetry.terminal_paths += result.stats.terminal_paths;
                 let Some(law) = result.law else {
-                    telemetry.declined_orders += 1;
+                    if workers == 1 {
+                        telemetry.declined_orders += 1;
+                    }
                     if result.decline == Some(LuckExactDecline::Cancelled) {
                         return Ok(());
                     }
@@ -419,7 +476,9 @@ impl Engine<'_, '_> {
                     }
                     continue;
                 };
-                telemetry.completed_orders += 1;
+                if workers == 1 {
+                    telemetry.completed_orders += 1;
+                }
                 let state = self.certified.as_mut().expect("certified request");
                 let retained = state
                     .entries
@@ -653,4 +712,62 @@ mod refinement_tests {
         assert!(proof.complete);
         assert!(pending_refinement(proof, || panic!("a completed proof must not become a new timeout")).is_none());
     }
+}
+
+/// Divide the remaining request allowance before dispatch; refund unused work.
+/// A partial law never enters the proof coordinator.
+#[cfg(not(target_arch = "wasm32"))]
+fn exact_batch(
+    master: &ournotes_sim::master::Master,
+    input: &expectation::FiniteSeedContext,
+    orders: &[[usize; 5]],
+    work: &mut ournotes_sim::live::full::LuckExactBudget,
+) -> Result<Option<Vec<ournotes_sim::live::full::LuckExactAttempt>>, Error> {
+    use ournotes_sim::live::full::{LuckExactBudget, luck_exact_law_with_ranking};
+    let n = orders.len() as u64;
+    let jobs: Vec<_> = orders
+        .iter()
+        .enumerate()
+        .map(|(i, order)| {
+            (
+                *order,
+                LuckExactBudget {
+                    remaining_runs: work.remaining_runs / n + u64::from((i as u64) < work.remaining_runs % n),
+                    remaining_frames: work.remaining_frames / n + u64::from((i as u64) < work.remaining_frames % n),
+                },
+            )
+        })
+        .collect();
+    work.remaining_runs = 0;
+    work.remaining_frames = 0;
+    let cancelled = crate::parallel::cancellation_check();
+    let setup = input.gekisou.as_ref().ok_or_else(|| Error::Domain("LUCK context missing".into()))?;
+    let result = crate::native_jobs::map(&mut vec![(); orders.len()], &jobs, &cancelled, |_, (order, allowance)| {
+        let mut remaining = allowance.clone();
+        let performers = order.map(|slot| input.performers[slot].clone());
+        let result = luck_exact_law_with_ranking(
+            master,
+            &performers,
+            &input.notes,
+            &input.events,
+            input.params,
+            setup,
+            &input.play,
+            &input.delta_times,
+            input.rank_confirmations.as_deref(),
+            &mut remaining,
+            &cancelled,
+        )?;
+        Ok((result, remaining))
+    })?;
+    Ok(result.map(|results| {
+        results
+            .into_iter()
+            .map(|(result, remaining)| {
+                work.remaining_runs += remaining.remaining_runs;
+                work.remaining_frames += remaining.remaining_frames;
+                result
+            })
+            .collect()
+    }))
 }
