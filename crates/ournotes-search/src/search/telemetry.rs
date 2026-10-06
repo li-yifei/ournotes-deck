@@ -24,6 +24,9 @@ const LEVELS: usize = 16;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Telemetry {
+    #[cfg(not(target_arch = "wasm32"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<Box<crate::parallel::ParallelTelemetry>>,
     pub format: &'static str,
     pub environment: Environment,
     pub proof: Proof,
@@ -45,6 +48,8 @@ pub struct Telemetry {
 impl Default for Telemetry {
     fn default() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            parallel: None,
             format: TELEMETRY_FORMAT,
             environment: Environment::default(),
             proof: Proof::default(),

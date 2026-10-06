@@ -110,6 +110,225 @@ fn metrics() -> Vec<Metric> {
     vec![Metric::Power, Metric::Score, Metric::ScoreAtLeast { threshold: 1 }, Metric::CappedScore { threshold: 1 }]
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn parallel_matches_serial_and_independent_oracle_including_fixed_leader_and_ties() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (data, roster) = fixture(6, &[0, 30]);
+    let constraints = [
+        Constraints::default(),
+        Constraints { leader: Some(1), ..Default::default() },
+        Constraints {
+            leader: Some(2),
+            include_members: vec![3],
+            exclude_members: vec![6],
+            exclude_snaps: vec![1],
+            ..Default::default()
+        },
+        Constraints { no_snaps: true, ..Default::default() },
+    ];
+    for metric in metrics() {
+        for c in &constraints {
+            let req = request(metric.clone(), 5, c.clone());
+            let serial = recommend(&data, &roster, &req).unwrap();
+            assert_eq!(
+                serial.results.iter().map(row).collect::<Vec<_>>(),
+                oracle(&data, &roster, &req).into_iter().take(req.k).collect::<Vec<_>>()
+            );
+            for workers in [2, 3].map(|n| n.min(parallel::max_workers())) {
+                let out = parallel::recommend(&data, &roster, &req, workers, Cancellation::default()).unwrap();
+                assert_eq!(out.completion, Completion::Complete);
+                assert_eq!(out.optimality, Optimality::Proven);
+                assert_eq!(out.results, serial.results, "workers={workers}, constraints={c:?}");
+                let p = out.telemetry.parallel.unwrap();
+                assert!(p.workers_used <= workers);
+                assert_eq!(p.tasks_finished, p.tasks);
+                if workers > 1 && c.exclude_members.is_empty() {
+                    assert!(p.tasks > 1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn parallel_budget_is_global_and_zero_deadline_and_cancellation_keep_unproven() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (data, roster) = fixture(7, &[10, 30]);
+    for limit in [0, 1, 7] {
+        let mut req = request(Metric::Power, 5, Constraints::default());
+        req.limits.max_candidates = Some(limit);
+        let out =
+            parallel::recommend(&data, &roster, &req, 3.min(parallel::max_workers()), Cancellation::default()).unwrap();
+        assert!(out.telemetry.leaves.visited <= limit);
+        assert!(out.telemetry.parallel.as_ref().unwrap().candidates <= limit);
+        assert_eq!(out.completion, Completion::TimedOut);
+        assert_eq!(out.exit_reason, ExitReason::CandidateLimit);
+        assert!(!out.telemetry.proof.complete);
+    }
+    let mut req = request(Metric::Power, 5, Constraints::default());
+    req.limits.time_limit_ms = Some(0);
+    let out =
+        parallel::recommend(&data, &roster, &req, 3.min(parallel::max_workers()), Cancellation::default()).unwrap();
+    assert!(out.results.is_empty());
+    assert_eq!(out.completion, Completion::TimedOut);
+    req.limits.time_limit_ms = None;
+    let cancel = Cancellation::default();
+    cancel.cancel();
+    let out = parallel::recommend(&data, &roster, &req, 3.min(parallel::max_workers()), cancel).unwrap();
+    assert!(out.results.is_empty());
+    assert_eq!(out.completion, Completion::TimedOut);
+    assert!(out.telemetry.parallel.unwrap().cancelled);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn parallel_normal_live_matches_serial_with_snap_skills() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (mut data, roster) = fixture(6, &[10]);
+    let mut s = common::synth_snaps(&mut Rng::new(88), 6, 1, &[2000]);
+    set_column(&mut s, "MasterMemberCard", &mut |r| r["_characterID"] = r["_id"].clone());
+    data.master = s.master();
+    let mut req: RecommendationRequest = serde_json::from_value(json!({
+        "format":"ournotes-deck.search-request/1",
+        "execution":{"kind":"live","scoreId":1004,"gekisou":false,"play":{"kind":"theoreticalBest"}},
+        "scenario":{"kind":"free","musicId":10},
+        "context":{"powerSnapshot":{"eventIds":[]}},
+        "metric":{"kind":"score"},"k":3,"strategy":{"kind":"branchAndBound"},
+        "limits":{"timeLimitMs":null,"maxCandidates":null,"cacheEntries":128}
+    }))
+    .unwrap();
+    for k in [1, 3, 100] {
+        req.k = k;
+        for leader in [None, Some(1)] {
+            req.constraints.leader = leader;
+            let serial = recommend(&data, &roster, &req).unwrap();
+            let out =
+                parallel::recommend(&data, &roster, &req, 3.min(parallel::max_workers()), Cancellation::default())
+                    .unwrap();
+            assert_eq!(out.completion, Completion::Complete);
+            assert_eq!(out.results, serial.results);
+            assert_eq!(out.telemetry.parallel.unwrap().tasks > 1, parallel::max_workers() > 1);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn parallel_can_cancel_an_active_search_and_rejects_invalid_inputs() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (data, roster) = fixture(8, &[10, 20, 30]);
+    let mut req = request(Metric::Power, 5, Constraints::default());
+    req.strategy = Strategy::Exhaustive;
+    let cancel = Cancellation::default();
+    std::thread::scope(|s| {
+        let c = cancel.clone();
+        s.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            c.cancel();
+        });
+        let out = parallel::recommend(&data, &roster, &req, 3.min(parallel::max_workers()), cancel).unwrap();
+        assert_eq!(out.completion, Completion::TimedOut);
+        assert!(out.telemetry.parallel.unwrap().cancelled);
+    });
+    assert!(parallel::recommend(&data, &roster, &req, 0, Cancellation::default()).is_err());
+    req.limits.time_limit_ms = Some(0);
+    req.constraints.include_members = vec![999];
+    assert!(
+        parallel::recommend(&data, &roster, &req, 3.min(parallel::max_workers()), Cancellation::default()).is_err()
+    );
+    assert_eq!(parallel::default_workers(), std::thread::available_parallelism().map_or(1, usize::from).div_ceil(2));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn parallel_membership_partitions_preserve_initial_decks_and_all_leaders() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (data, roster) = fixture(6, &[0, 30]);
+    for metric in metrics() {
+        for leader in [None, Some(1)] {
+            let mut req = request(metric.clone(), 5, Constraints { leader, ..Default::default() });
+            let serial = recommend(&data, &roster, &req).unwrap();
+            req.initial_decks = serial
+                .results
+                .iter()
+                .map(|d| ournotes_search::types::DeckInput { members: d.members, snaps: d.snaps })
+                .collect();
+            let out = parallel::recommend(&data, &roster, &req, parallel::default_workers(), Cancellation::default())
+                .unwrap();
+            assert_eq!(out.completion, Completion::Complete);
+            assert_eq!(out.results, serial.results);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn parallel_thread_parameter_range_defaults_and_native_dispatch() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (data, roster) = fixture(6, &[0, 30]);
+    let req = request(Metric::Power, 5, Constraints::default());
+    let maximum = parallel::max_workers();
+    assert_eq!(parallel::default_workers(), maximum.div_ceil(2));
+    let expected = recommend(&data, &roster, &req).unwrap();
+    for threads in [1, maximum] {
+        let actual = parallel::with_native_threads(threads, || recommend(&data, &roster, &req)).unwrap().unwrap();
+        assert_eq!(actual.results, expected.results);
+        assert_eq!(actual.telemetry.parallel.unwrap().workers, threads);
+    }
+    assert!(recommend(&data, &roster, &req).unwrap().telemetry.parallel.is_none(), "native scope restored");
+    for threads in [0, maximum + 1, usize::MAX] {
+        assert!(parallel::recommend(&data, &roster, &req, threads, Cancellation::default()).is_err());
+        assert!(
+            parallel::with_native_threads(threads, || panic!("invalid count must reject before calling closure"))
+                .is_err()
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore = "manual multicore throughput measurement"]
+fn parallel_live_throughput() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (mut data, roster) = fixture(8, &[10, 20]);
+    let mut s = common::synth_snaps(&mut Rng::new(88), 8, 2, &[2000]);
+    set_column(&mut s, "MasterMemberCard", &mut |r| r["_characterID"] = r["_id"].clone());
+    data.master = s.master();
+    data.charts[0].notes = (1..=64).map(|id| ChartNote { id, time_ms: id * 200, note_type: 1 }).collect();
+    data.charts[0].judgement_types = vec![1; 64];
+    let req: RecommendationRequest = serde_json::from_value(json!({
+        "format":"ournotes-deck.search-request/1",
+        "execution":{"kind":"live","scoreId":1004,"gekisou":false,"play":{"kind":"theoreticalBest"}},
+        "scenario":{"kind":"free","musicId":10},"context":{"powerSnapshot":{"eventIds":[]}},
+        "metric":{"kind":"score"},"k":5,"strategy":{"kind":"exhaustive"},
+        "limits":{"timeLimitMs":2000,"cacheEntries":256}
+    }))
+    .unwrap();
+    let mut expected = None;
+    for workers in [1, 4, 8].map(|n| n.min(parallel::max_workers())) {
+        let out = parallel::recommend(&data, &roster, &req, workers, Cancellation::default()).unwrap();
+        assert_eq!(out.completion, Completion::Complete);
+        if let Some(expected) = &expected {
+            assert_eq!(&out.results, expected);
+        } else {
+            expected = Some(out.results.clone());
+        }
+        let p = out.telemetry.parallel.as_ref().unwrap();
+        eprintln!(
+            "workers={} used={} tasks={} evaluated={} simulations={} elapsed_ms={:.0}",
+            workers,
+            p.workers_used,
+            p.tasks,
+            out.telemetry.leaves.evaluated,
+            out.telemetry.leaves.simulations,
+            out.elapsed_ms
+        );
+        assert!(p.workers_used <= workers);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Row {
     members: [i64; 5],
