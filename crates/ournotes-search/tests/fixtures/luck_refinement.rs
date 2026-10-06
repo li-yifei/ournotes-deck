@@ -191,3 +191,112 @@ fn certified_seed_budget_preserves_the_complete_canonical_ranking() {
         assert!(actual.telemetry.phases.iter().any(|phase| phase.name == "search"));
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_luck_orders_and_refinement_match_serial_proof() {
+    use ournotes_search::parallel::{self, Cancellation};
+    for (threshold, k, cache) in [(545_749, 12, 64), (610_000, 1, 0)] {
+        let (data, roster, mut request) = inputs(threshold, k, cache);
+        request.limits.time_limit_ms = None;
+        let serial = engine::recommend(&data, &roster, &request).unwrap();
+        for workers in [2, 4].map(|n| n.min(parallel::max_workers())) {
+            let out = parallel::recommend(&data, &roster, &request, workers, Cancellation::default()).unwrap();
+            assert_eq!(out.completion, serial.completion);
+            assert_eq!(out.results, serial.results);
+            assert_eq!(out.optimality, serial.optimality);
+            assert_eq!(out.telemetry.parallel.unwrap().simulation_worker_limit, workers);
+            assert!(out.telemetry.lottery_refinement.replay_runs <= 240_000);
+            assert!(out.telemetry.lottery_refinement.frames <= 8_000_000);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_deterministic_gekisou_partitions_match_exhaustive() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let synth = synthetic_master(6, 1, 6);
+    let mut document = data_document(&synth, 6, 1, 6);
+    document["charts"][0]["fevers"] = json!({"startMs":[150],"endMs":[400]});
+    let data = DeckData::from_json(&document.to_string()).unwrap();
+    let roster = Roster::from_json(&roster_document(6, 1, 6).to_string()).unwrap();
+    let mut request = joint_request("mission", true, json!({"kind":"score"}));
+    request.limits.time_limit_ms = None;
+    request.strategy = Strategy::Exhaustive;
+    let serial = engine::recommend(&data, &roster, &request).unwrap();
+    for strategy in [Strategy::Exhaustive, Strategy::BranchAndBound] {
+        request.strategy = strategy;
+        let n = 3.min(parallel::max_workers());
+        let result = parallel::recommend(&data, &roster, &request, n, Cancellation::default()).unwrap();
+        assert_eq!(result.completion, Completion::Complete);
+        assert_eq!(result.results, serial.results);
+        let t = result.telemetry.parallel.unwrap();
+        assert!(t.fallback.is_none());
+        if n > 1 {
+            assert!(t.tasks > 1);
+        }
+        assert_eq!(t.simulation_worker_limit, 1, "no nested parallelism");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_luck_deadline_and_precancel_never_claim_proven() {
+    use ournotes_search::{
+        parallel::{self, Cancellation},
+        types::Optimality,
+    };
+    let (data, roster, mut request) = inputs(610_000, 1, 0);
+    for zero_deadline in [true, false] {
+        request.limits.time_limit_ms = if zero_deadline { Some(0) } else { None };
+        let cancel = Cancellation::default();
+        if !zero_deadline {
+            cancel.cancel();
+        }
+        let result = parallel::recommend(&data, &roster, &request, 2.min(parallel::max_workers()), cancel).unwrap();
+        assert_ne!(result.optimality, Optimality::Proven);
+        assert!(result.results.is_empty());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore = "manual native LUCK timing"]
+fn native_luck_throughput() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (data, roster, mut request) = inputs(610_000, 1, 64);
+    request.limits.time_limit_ms = None;
+    let mut expected = None;
+    for n in [1, 2, 4, 8].map(|n| n.min(parallel::max_workers())) {
+        let result = parallel::recommend(&data, &roster, &request, n, Cancellation::default()).unwrap();
+        assert_eq!(result.completion, Completion::Complete);
+        if let Some(expected) = &expected {
+            assert_eq!(&result.results, expected);
+        } else {
+            expected = Some(result.results.clone());
+        }
+        eprintln!(
+            "LUCK threads={n} ms={:.2} runs={} installed={}",
+            result.elapsed_ms,
+            result.telemetry.lottery_refinement.replay_runs,
+            result.telemetry.lottery_refinement.installed_orders
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn three_luck_ranges_parallel_match_serial() {
+    use ournotes_search::parallel::{self, Cancellation};
+    for cache in [0, 64] {
+        let (data, roster, mut request) = inputs_with_missions(1, 3, cache, [2, 2, 2]);
+        request.limits.time_limit_ms = None;
+        let expected = engine::recommend(&data, &roster, &request).unwrap();
+        let actual =
+            parallel::recommend(&data, &roster, &request, 3.min(parallel::max_workers()), Cancellation::default())
+                .unwrap();
+        assert_eq!(actual.completion, expected.completion);
+        assert_eq!(actual.results, expected.results);
+    }
+}

@@ -33,6 +33,7 @@ struct Control {
     cutoff: RwLock<Option<(i128, i64)>>,
     share: bool,
     deadline: Option<Instant>,
+    simulation_workers: usize,
 }
 impl Control {
     fn new(request: &RecommendationRequest, cancellation: Cancellation, share: bool, start: Instant) -> Self {
@@ -45,6 +46,7 @@ impl Control {
             top: Mutex::new(Vec::new()),
             cutoff: RwLock::new(None),
             share,
+            simulation_workers: 1,
             deadline: request
                 .limits
                 .time_limit_ms
@@ -84,6 +86,17 @@ pub fn with_native_threads<T>(workers: usize, run: impl FnOnce() -> T) -> Result
 }
 pub(crate) fn native_workers() -> usize {
     NATIVE.with(|v| v.get().unwrap_or_else(default_workers))
+}
+pub(crate) fn simulation_workers() -> usize {
+    CONTROL.with(|v| v.borrow().as_ref().map_or(1, |c| c.simulation_workers))
+}
+pub(crate) fn cancellation_check() -> impl Fn() -> bool + Send + Sync {
+    let control = CONTROL.with(|v| v.borrow().clone());
+    move || {
+        control
+            .as_ref()
+            .is_some_and(|c| c.cancellation.is_cancelled() || c.deadline.is_some_and(|d| Instant::now() >= d))
+    }
 }
 fn controlled<T>(control: Arc<Control>, run: impl FnOnce() -> T) -> T {
     struct Reset;
@@ -226,6 +239,8 @@ pub fn recommend_json_with_threads(
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParallelTelemetry {
+    /// Per-candidate simulation allowance; frontier coordination remains serial.
+    pub simulation_worker_limit: usize,
     pub workers: usize,
     pub workers_used: usize,
     pub tasks: usize,
@@ -257,10 +272,8 @@ pub(crate) fn recommend_started(
     start: Instant,
 ) -> Result<RecommendationOutcome, Error> {
     validate_workers(workers)?;
-    let fallback = if matches!(request.strategy, Strategy::Candidate { .. }) {
+    let mut fallback = if matches!(request.strategy, Strategy::Candidate { .. }) {
         Some("candidate strategy preserves its serial proposal sequence")
-    } else if matches!(request.execution, Execution::Live { gekisou: true, .. }) {
-        Some("certified lottery frontier remains request-local")
     } else {
         None
     };
@@ -271,6 +284,10 @@ pub(crate) fn recommend_started(
     } else {
         build_card_pool(data, roster, request)?
     };
+    let certified = crate::search::physical::needs_certified_frontier(&built)?;
+    if certified {
+        fallback = Some("certified frontier coordinated serially; order simulations run in parallel");
+    }
     for d in &request.initial_decks {
         let d = built.pool().deck(d.members, d.snaps, [0, 1, 2, 3, 4])?;
         built.domain().check_fixed(
@@ -296,10 +313,15 @@ pub(crate) fn recommend_started(
     if workers == 1 || tasks.len() <= 1 || fallback.is_some() || cancellation.is_cancelled() {
         // A single feasible part still uses the ordinary serial bound plan.
         let built = if partitioning { build_card_pool(data, roster, request)? } else { built };
-        let mut out = controlled(Arc::new(Control::new(request, cancellation.clone(), false, start)), || {
+        let mut control = Control::new(request, cancellation.clone(), false, start);
+        if certified {
+            control.simulation_workers = workers;
+        }
+        let mut out = controlled(Arc::new(control), || {
             crate::search::dispatch::execute(&built, None, start, start.elapsed().as_secs_f64() * 1000.0, None)
         })?;
         out.telemetry.parallel = Some(Box::new(ParallelTelemetry {
+            simulation_worker_limit: if certified { workers } else { 1 },
             workers,
             workers_used: 1,
             tasks: 1,
@@ -422,6 +444,7 @@ pub(crate) fn recommend_started(
         out.telemetry.proof.best_gap = out.telemetry.proof.best.as_ref().map(|_| 0.0);
     }
     out.telemetry.parallel = Some(Box::new(ParallelTelemetry {
+        simulation_worker_limit: 1,
         workers,
         workers_used: used.load(Ordering::Relaxed),
         tasks: tasks.len(),
