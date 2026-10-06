@@ -61,6 +61,7 @@ impl Control {
 }
 thread_local! {
     static CONTROL: RefCell<Option<Arc<Control>>> = const { RefCell::new(None) };
+    static NATIVE_CANCEL: RefCell<Option<Cancellation>> = const { RefCell::new(None) };
     static NATIVE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 pub(crate) fn native_enabled() -> bool {
@@ -83,6 +84,20 @@ pub fn with_native_threads<T>(workers: usize, run: impl FnOnce() -> T) -> Result
     }
     let _reset = Reset(NATIVE.with(|v| v.replace(Some(workers))));
     Ok(run())
+}
+/// Carry cooperative cancellation through account resolution into native workers.
+pub fn with_native_cancellation<T>(cancellation: Cancellation, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Cancellation>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NATIVE_CANCEL.with(|v| *v.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(NATIVE_CANCEL.with(|v| v.replace(Some(cancellation))));
+    run()
+}
+pub(crate) fn native_cancellation() -> Cancellation {
+    NATIVE_CANCEL.with(|v| v.borrow().clone().unwrap_or_default())
 }
 pub(crate) fn native_workers() -> usize {
     NATIVE.with(|v| v.get().unwrap_or_else(default_workers))
@@ -260,7 +275,7 @@ pub fn recommend(
     workers: usize,
     cancellation: Cancellation,
 ) -> Result<RecommendationOutcome, Error> {
-    recommend_started(data, roster, request, workers, cancellation, Instant::now())
+    recommend_started(data, roster, request, workers, cancellation, Instant::now(), None)
 }
 
 pub(crate) fn recommend_started(
@@ -270,6 +285,7 @@ pub(crate) fn recommend_started(
     workers: usize,
     cancellation: Cancellation,
     start: Instant,
+    mut progress: Option<crate::search::physical::ProgressHook<'_>>,
 ) -> Result<RecommendationOutcome, Error> {
     validate_workers(workers)?;
     let mut fallback = if matches!(request.strategy, Strategy::Candidate { .. }) {
@@ -318,7 +334,7 @@ pub(crate) fn recommend_started(
             control.simulation_workers = workers;
         }
         let mut out = controlled(Arc::new(control), || {
-            crate::search::dispatch::execute(&built, None, start, start.elapsed().as_secs_f64() * 1000.0, None)
+            crate::search::dispatch::execute(&built, None, start, start.elapsed().as_secs_f64() * 1000.0, progress)
         })?;
         out.telemetry.parallel = Some(Box::new(ParallelTelemetry {
             simulation_worker_limit: if certified { workers } else { 1 },
@@ -341,6 +357,8 @@ pub(crate) fn recommend_started(
     let next = AtomicUsize::new(0);
     let used = AtomicUsize::new(0);
     let control = Arc::new(Control::new(request, cancellation.clone(), true, start));
+    let interval = progress.as_ref().map(|p| p.interval);
+    let (updates, receiver) = std::sync::mpsc::channel();
     let outcomes = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers.min(tasks.len()))
             .map(|_| {
@@ -348,6 +366,7 @@ pub(crate) fn recommend_started(
                 let next = &next;
                 let used = &used;
                 let control = control.clone();
+                let updates = updates.clone();
                 scope.spawn(move || {
                     controlled(control.clone(), || {
                         let mut out = Vec::new();
@@ -366,12 +385,19 @@ pub(crate) fn recommend_started(
                                 } else {
                                     prepared = Some(build_card_pool(data, roster, task)?);
                                 }
+                                let mut report = |out: RecommendationOutcome| {
+                                    let _ = updates.send(out);
+                                };
+                                let hook = interval.map(|interval| crate::search::physical::ProgressHook {
+                                    interval,
+                                    report: &mut report as &mut dyn FnMut(RecommendationOutcome),
+                                });
                                 crate::search::dispatch::execute(
                                     prepared.as_ref().expect("worker problem initialized"),
                                     None,
                                     start,
                                     start.elapsed().as_secs_f64() * 1000.0,
-                                    None,
+                                    hook,
                                 )
                             })();
                             if matches!(task.execution, Execution::Live { .. }) {
@@ -391,6 +417,25 @@ pub(crate) fn recommend_started(
                 })
             })
             .collect();
+        drop(updates);
+        let mut reported = start;
+        while handles.iter().any(|h| !h.is_finished()) {
+            if let Ok(mut snapshot) = receiver.recv_timeout(std::time::Duration::from_millis(25)) {
+                if let Some(hook) = progress.as_mut() {
+                    if reported.elapsed() >= hook.interval {
+                        snapshot.results = control.top.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        snapshot.completion = Completion::TimedOut;
+                        snapshot.optimality = Optimality::Unproven;
+                        // A partition's proof describes its own domain. Global proof is published on completion.
+                        snapshot.telemetry.proof = Default::default();
+                        snapshot.telemetry.leaves.visited = control.visits.load(Ordering::Relaxed);
+                        snapshot.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        (hook.report)(snapshot);
+                        reported = Instant::now();
+                    }
+                }
+            }
+        }
         let mut all = Vec::new();
         for h in handles {
             all.extend(h.join().map_err(|_| Error::Domain("parallel search worker panicked".into()))?);
