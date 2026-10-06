@@ -6,3 +6,9 @@
 /python/dist
 /python/**/__pycache__
 /python/.pytest_cache
+/resources/local/
+
+/adb-saves/
+/tools/save-decrypt/status.json
+__pycache__/
+*.pyc
