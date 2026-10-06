@@ -52,23 +52,40 @@ pub(super) struct CarrierSplit {
     plain_power: Vec<Vec<OnceCell<Option<Plain<i64>>>>>,
     /// `[r]`: the multisets of at most `r` lists.
     sets: Vec<Vec<Vec<u16>>>,
-    /// Envelopes by sorted carrier lists (`env_key`).
-    envs: RefCell<FxHashMap<u32, Rc<SplitEnv>>>,
-    /// The approximate bytes of the envelopes kept and their tables.
+    /// One exclusive borrow per node; immutable tables stay outside this cache.
+    cache: RefCell<SplitCache>,
+}
+
+#[derive(Default)]
+struct SplitCache {
+    /// Request-local arena offsets, invalidated together on eviction.
+    envs: FxHashMap<u32, usize>,
+    arena: Vec<SplitEnv>,
+    /// Approximate retained bytes. Cell lets lazy table builders account bytes
+    /// while the current envelope is exclusively borrowed from the arena.
     bytes: Cell<usize>,
+}
+
+impl SplitCache {
+    fn clear(&mut self) {
+        self.envs.clear();
+        self.arena.clear();
+        self.bytes.set(0);
+    }
 }
 
 struct SplitEnv {
     env: KeyedEnvelope,
     /// The position-mean gain of every member's class (at `class_at[member] + class`), NaN until read.
-    read: RefCell<Vec<f64>>,
+    read: Vec<Cell<f64>>,
     /// `[start][list]`: the gains of the list's pairs by character (filled on first use).
     gain: Vec<Vec<OnceCell<ByCharacter<f64>>>>,
     /// `[start]`: the gain tables of the pairs that are no carrier (filled on first use; None when a gain is not
     /// finite).
     plain: Vec<OnceCell<Option<Plain<f64>>>>,
     /// The coupled tables by (start, leader profile, weight index), filled on first use.
-    coupled: RefCell<FxHashMap<(usize, usize, i32), Rc<Coupled>>>,
+    coupled: FxHashMap<(usize, usize, i32), usize>,
+    tables: Vec<Coupled>,
 }
 
 /// The tables of one weight `λ`: every pair reads `λ·power + gain/λ`, rounded up.
@@ -184,8 +201,7 @@ impl CarrierSplit {
             power,
             plain_power,
             sets,
-            envs: RefCell::default(),
-            bytes: Cell::new(0),
+            cache: RefCell::default(),
         })
     }
 
@@ -199,42 +215,45 @@ impl CarrierSplit {
         self.keys.list(m, c).is_none() && self.index[m][c] as usize >= self.starts[k]
     }
 
-    /// Counts `bytes` more kept.
-    fn keep(&self, bytes: usize) {
-        self.bytes.set(self.bytes.get() + bytes);
+    /// Counts additional retained table bytes through the current cache borrow.
+    fn keep(bytes: &Cell<usize>, additional: usize) {
+        bytes.set(bytes.get() + additional);
     }
 
-    fn env(&self, ids: &[u16]) -> Rc<SplitEnv> {
+    fn env(&self, cache: &mut SplitCache, ids: &[u16]) -> usize {
         let key = env_key(ids);
-        if let Some(e) = self.envs.borrow().get(&key) {
-            return e.clone();
+        if let Some(&index) = cache.envs.get(&key) {
+            return index;
         }
-        let e = Rc::new(SplitEnv {
+        // Every handle is consumed inside one node before the next env() call.
+        // Clearing both structures therefore invalidates no outstanding handle.
+        if cache.arena.len() >= ENV_CACHE || cache.bytes.get() >= TABLE_BUDGET {
+            cache.clear();
+        }
+        let e = SplitEnv {
             env: self.keys.build_envelope(ids, 0),
-            read: RefCell::new(vec![f64::NAN; self.classes]),
+            read: (0..self.classes).map(|_| Cell::new(f64::NAN)).collect(),
             gain: self.starts.iter().map(|_| (0..self.lists).map(|_| OnceCell::new()).collect()).collect(),
             plain: self.starts.iter().map(|_| OnceCell::new()).collect(),
-            coupled: RefCell::default(),
-        });
-        let mut envs = self.envs.borrow_mut();
-        if envs.len() >= ENV_CACHE || self.bytes.get() >= TABLE_BUDGET {
-            envs.clear();
-            self.bytes.set(0);
-        }
-        self.keep(e.env.bytes() + self.classes * std::mem::size_of::<f64>());
-        envs.insert(key, e.clone());
-        e
+            coupled: FxHashMap::default(),
+            tables: Vec::new(),
+        };
+        Self::keep(&cache.bytes, e.env.bytes() + self.classes * std::mem::size_of::<f64>());
+        let index = cache.arena.len();
+        cache.arena.push(e);
+        cache.envs.insert(key, index);
+        index
     }
 
     /// The position-mean gain of a pool member and choice under an envelope (read once per member and class).
     fn gain(&self, e: &SplitEnv, m: usize, c: usize) -> f64 {
         let at = self.class_at[m] + self.keys.class(m, c);
-        let read = e.read.borrow()[at];
+        let read = e.read[at].get();
         if !read.is_nan() {
             return read;
         }
         let g = super::super::uniform::mean_up(&self.keys.gains_uncached(&e.env, m, c));
-        e.read.borrow_mut()[at] = g;
+        e.read[at].set(g);
         g
     }
 
@@ -249,16 +268,16 @@ impl CarrierSplit {
     }
 
     /// The gains of a list's pairs from suffix start `k` on by character under an envelope.
-    fn gains<'a>(&self, e: &'a SplitEnv, k: usize, list: usize) -> &'a ByCharacter<f64> {
+    fn gains<'a>(&self, e: &'a SplitEnv, bytes: &Cell<usize>, k: usize, list: usize) -> &'a ByCharacter<f64> {
         e.gain[k][list].get_or_init(|| {
             let table = ByCharacter::compile(self.list_rows(k, list, |m, c| self.gain(e, m, c)), 0.0);
-            self.keep(table.bytes());
+            Self::keep(bytes, table.bytes());
             table
         })
     }
 
     /// The tables of the pairs from suffix start `k` on that are no carrier, with `value` per pair as a gain.
-    fn plain_tables(&self, k: usize, value: &dyn Fn(usize, usize) -> f64) -> Option<Plain<f64>> {
+    fn plain_tables(&self, bytes: &Cell<usize>, k: usize, value: &dyn Fn(usize, usize) -> f64) -> Option<Plain<f64>> {
         let table = Plain::compile(
             &self.members,
             self.characters,
@@ -271,13 +290,13 @@ impl CarrierSplit {
             0.0,
             f64::NEG_INFINITY,
         )?;
-        self.keep(table.bytes());
+        Self::keep(bytes, table.bytes());
         Some(table)
     }
 
     /// The gain tables of the pairs from suffix start `k` on that are no carrier, under an envelope.
-    fn plain<'a>(&self, e: &'a SplitEnv, k: usize) -> Option<&'a Plain<f64>> {
-        e.plain[k].get_or_init(|| self.plain_tables(k, &|m, c| self.gain(e, m, c))).as_ref()
+    fn plain<'a>(&self, e: &'a SplitEnv, bytes: &Cell<usize>, k: usize) -> Option<&'a Plain<f64>> {
+        e.plain[k].get_or_init(|| self.plain_tables(bytes, k, &|m, c| self.gain(e, m, c))).as_ref()
     }
 
     /// The power tables of the pairs from suffix start `k` on that are no carrier, for a leader profile.
@@ -301,22 +320,34 @@ impl CarrierSplit {
     }
 
     /// The coupled tables of weight `WEIGHT_STEP^j` for the pairs from suffix start `k` on under an envelope.
-    fn coupled(&self, b: &JointBounds, e: &SplitEnv, k: usize, profile: usize, j: i32) -> Rc<Coupled> {
-        if let Some(c) = e.coupled.borrow().get(&(k, profile, j)) {
-            return c.clone();
-        }
-        let lambda = WEIGHT_STEP.powi(j);
-        let value = |m: usize, c: usize| {
-            let power = b.a[m] + b.lead[profile][m] + if c == 0 { 0 } else { b.w[m][c - 1] };
-            add_up((lambda * power as f64).next_up(), (self.gain(e, m, c) / lambda).next_up())
+    fn coupled<'a>(
+        &self,
+        b: &JointBounds,
+        e: &'a mut SplitEnv,
+        bytes: &Cell<usize>,
+        k: usize,
+        profile: usize,
+        j: i32,
+    ) -> &'a Coupled {
+        let key = (k, profile, j);
+        let index = if let Some(&index) = e.coupled.get(&key) {
+            index
+        } else {
+            let lambda = WEIGHT_STEP.powi(j);
+            let value = |m: usize, c: usize| {
+                let power = b.a[m] + b.lead[profile][m] + if c == 0 { 0 } else { b.w[m][c - 1] };
+                add_up((lambda * power as f64).next_up(), (self.gain(e, m, c) / lambda).next_up())
+            };
+            let lists: Vec<ByCharacter<f64>> =
+                (0..self.lists).map(|list| ByCharacter::compile(self.list_rows(k, list, value), 0.0)).collect();
+            Self::keep(bytes, lists.iter().map(ByCharacter::bytes).sum());
+            let plain = self.plain_tables(bytes, k, &value);
+            let index = e.tables.len();
+            e.tables.push(Coupled { lists, plain });
+            e.coupled.insert(key, index);
+            index
         };
-        let lists: Vec<ByCharacter<f64>> =
-            (0..self.lists).map(|list| ByCharacter::compile(self.list_rows(k, list, value), 0.0)).collect();
-        self.keep(lists.iter().map(ByCharacter::bytes).sum());
-        let plain = self.plain_tables(k, &value);
-        let c = Rc::new(Coupled { lists, plain });
-        e.coupled.borrow_mut().insert((k, profile, j), c.clone());
-        c
+        &e.tables[index]
     }
 }
 
@@ -366,6 +397,15 @@ fn runs(t: &[u16]) -> impl Iterator<Item = (usize, usize)> + '_ {
 }
 
 impl JointBounds {
+    /// Diagnostics reset the exact same arena/maps that production eviction clears.
+    #[cfg(feature = "search-diagnostics")]
+    pub(crate) fn reset_carrier_split_cache(&self) -> bool {
+        let Some(split) = self.carrier_split.as_ref() else { return false };
+        let mut cache = split.cache.borrow_mut();
+        cache.clear();
+        true
+    }
+
     /// The carrier split bound, as a payoff numerator over the order masses `orders` (position-mean gains read the
     /// same at every position), of the completions of a prefix at `depth` (1..5) whose slots to fill take candidates
     /// from choice index `from` on. Stops at the first multiset whose bound exceeds `threshold`, returning that bound;
@@ -416,6 +456,8 @@ impl JointBounds {
         if !(1..5).contains(&depth) {
             return None;
         }
+        let mut cache = split.cache.borrow_mut();
+        let cache = &mut *cache;
         let k = split.start(from);
         let mass = i128::try_from(orders.iter().map(|o| o.1).sum::<u128>()).ok()?;
         let keys = &split.keys;
@@ -424,26 +466,30 @@ impl JointBounds {
         let r = 5 - depth;
         let mut taken = vec![false; split.characters];
         let mut taken_snaps = vec![false; split.snaps];
-        let mut placed = Vec::with_capacity(depth);
-        let mut placed_ids = Vec::with_capacity(depth);
+        let mut placed = [(0, 0); 5];
+        let mut placed_ids = [0u16; 5];
+        let mut carrier_count = 0;
         let mut p0 = 0i64;
-        for &slot in &SLOTS[..depth] {
+        for (at, &slot) in SLOTS[..depth].iter().enumerate() {
             let (m, c) = (p.members[slot], choices[slot]);
             taken[split.character[m] as usize] = true;
             if c > 0 {
                 taken_snaps[c - 1] = true;
             }
             if let Some(id) = keys.list(m, c) {
-                placed_ids.push(id);
+                placed_ids[carrier_count] = id;
+                carrier_count += 1;
             }
             p0 += self.a[m] + self.lead[profile][m] + if c == 0 { 0 } else { self.w[m][c - 1] };
-            placed.push((m, c));
+            placed[at] = (m, c);
         }
+        let placed = &placed[..depth];
+        let placed_ids = &placed_ids[..carrier_count];
         let commands = keys.commands_of(placed.iter().copied(), r);
         // [slots to fill without a carrier]: their power, the same under every envelope
         let mut free_power = [None; 5];
         let mut best = i128::MIN;
-        let mut ids = Vec::with_capacity(5);
+        let mut ids = [0u16; 5];
         'sets: for t in &split.sets[r] {
             // the carriers of `T`: per list, its best characters (characters may repeat across lists, Snaps across
             // lists and slots)
@@ -454,23 +500,26 @@ impl JointBounds {
                     None => continue 'sets,
                 }
             }
-            ids.clear();
-            ids.extend_from_slice(&placed_ids);
-            ids.extend_from_slice(t);
+            let count = carrier_count + t.len();
+            let ids = &mut ids[..count];
+            ids[..carrier_count].copy_from_slice(placed_ids);
+            ids[carrier_count..].copy_from_slice(t);
             ids.sort_unstable();
-            let e = split.env(&ids);
+            let index = split.env(cache, ids);
+            let bytes = &cache.bytes;
+            let e = &mut cache.arena[index];
             let a0 = keys.a0_of(&e.env, commands);
             let mut gain = 0f64;
-            for &(m, c) in &placed {
-                gain = add_up(gain, split.gain(&e, m, c));
+            for &(m, c) in placed {
+                gain = add_up(gain, split.gain(e, m, c));
             }
             let placed_gain = gain;
             for (list, n) in runs(t) {
-                gain = add_up(gain, split.gains(&e, k, list).top(&taken, &taken_snaps, n, 0.0, add_up)?);
+                gain = add_up(gain, split.gains(e, bytes, k, list).top(&taken, &taken_snaps, n, 0.0, add_up)?);
             }
             let k0 = r - t.len();
             if k0 > 0 {
-                let tables = split.plain(&e, k)?;
+                let tables = split.plain(e, bytes, k)?;
                 let pp = match free_power[k0] {
                     Some(v) => v,
                     None => {
@@ -488,7 +537,7 @@ impl JointBounds {
                 && let Some(j) = weight(add_up(a0, gain), power)
             {
                 let lambda = WEIGHT_STEP.powi(j);
-                let c = split.coupled(self, &e, k, profile, j);
+                let c = split.coupled(self, e, bytes, k, profile, j);
                 // the prefix's terms, then the slots to fill (one value per pair)
                 let mut sum = add_up((lambda * p0 as f64).next_up(), (add_up(a0, placed_gain) / lambda).next_up());
                 let mut complete = true;
@@ -571,12 +620,15 @@ impl JointBounds {
             a0: 0.0,
             lists: Vec::new(),
         };
+        let mut cache = split.cache.borrow_mut();
+        let cache = &mut *cache;
         let mut count = 0u64;
         let mut visit = |pick: &[(usize, usize)]| {
             count += 1;
             let mut ids: Vec<u16> = placed.iter().chain(pick).filter_map(|&(m, c)| keys.list(m, c)).collect();
             ids.sort_unstable();
-            let e = split.env(&ids);
+            let index = split.env(cache, &ids);
+            let e = &mut cache.arena[index];
             let mut gain = 0f64;
             for &(m, c) in &placed {
                 gain = add_up(gain, super::super::uniform::mean_up(&keys.gains(&e.env, m, c)));
@@ -584,7 +636,7 @@ impl JointBounds {
             let mut pw = p0;
             for &(m, c) in pick {
                 pw += power(m, c);
-                gain = add_up(gain, split.gain(&e, m, c));
+                gain = add_up(gain, split.gain(e, m, c));
             }
             let level = self.carrier_level(ids.len());
             let a0 = keys.a0(&e.env, placed.iter().copied(), r);

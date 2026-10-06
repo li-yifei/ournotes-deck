@@ -19,6 +19,8 @@ pub mod domain;
 pub mod engine;
 pub mod handler;
 pub mod owned_snapshot;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod parallel;
 pub mod recommendation;
 pub mod search;
 pub mod skip_event;

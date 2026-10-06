@@ -162,6 +162,11 @@ fn visit(
         return Ok(true);
     };
     let payoff = payoff * scale;
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::parallel::inferior(payoff, power) {
+        count.pruned += 1;
+        return Ok(true);
+    }
     if top.len() == k {
         let kth = &top[k - 1];
         // Equal payoff and power keep every completion whose canonical key may still come first.
