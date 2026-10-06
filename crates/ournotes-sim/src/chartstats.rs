@@ -844,12 +844,12 @@ pub fn document_with(data: &DeckData, options: &Options) -> Result<serde_json::V
             "unitValue": UNIT_VALUE,
             "expectation": "independent nominal lottery and skill probabilities; estimates as [center, outward interval half-width]",
             "replaySeeds": "one replay seed without a luck range, else the requested published seeds",
-            "ranks": "Gekisou on at rank r_i (1..5) in range i: score becomes score - sum_i rankBonus_i + sum_i \
-                      rangeScore_i * rankBonusPercents_i[r_i - 1] / 100 within one flooring point per range, and weights[kind][k] becomes \
+            "ranks": "fixed ranks r_i (1..5): retain the measured expected rank-1 bonus at rank 1; other ranks \
+                      subtract that expectation and enclose the target bonus with binary32 and truncation bounds. In the linear range domain, weights[kind][k] becomes \
                       weights[kind][k] + sum_i (rankBonusPercents_i[r_i - 1] - rankBonusPercents_i[0]) / 100 * \
-                      rangeWeights[kind][k][i]; rankCheck plays the check deck at random ranks",
-            "perfect": "scorePerfect and rangeScorePerfect: the no-skill score (rank 1 bonuses included) and range \
-                        scores on the same play with every Just judged Perfect",
+                      rangeWeights[kind][k][i]; rankCheck compares a full fixed-rank expectation against its prediction interval",
+            "perfect": "scorePerfect, rangeScorePerfect and rankBonusPerfect: expected whole-live score, range \
+                        scores and rank-1 bonuses on the same play with every Just judged Perfect",
             "off": "offSeeds: Gekisou off (no Just, luck, Gekisou combo or rank bonus), theoretical best play (every \
                     note Perfect at its time), seed 0, every chart; the same formula on its score and weights, a \
                     kind whose conditions read the Gekisou state has null weights; checked",
