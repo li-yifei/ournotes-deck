@@ -130,6 +130,28 @@ fn native_luck_orders_and_refinement_match_serial_proof() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
+fn luck_fallback_warmup_preserves_exhaustive_result() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (mut data, roster, mut request) = inputs(545_749, 5, 64);
+    for skill in &mut data.master.gekisou_skills {
+        skill.gekisou_mission_type = 2;
+    }
+    // Damage reduction is simulated but deliberately refused by the live upper-bound compiler.
+    data.master.gekisou_skill_effects[0].skill_effect_type = 3004;
+    request.limits.time_limit_ms = None;
+    let reference = engine::recommend(&data, &roster, &request).unwrap();
+    request.strategy = Strategy::BranchAndBound;
+    let actual =
+        parallel::recommend(&data, &roster, &request, 2.min(parallel::max_workers()), Cancellation::default()).unwrap();
+    assert_eq!(actual.completion, reference.completion);
+    assert_eq!(actual.results, reference.results);
+    assert_eq!(actual.optimality, reference.optimality);
+    assert!(actual.telemetry.incumbents.warm_start.evaluations > 0);
+    assert!(actual.telemetry.incumbents.warm_start.pilot_orders >= 10);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn native_deterministic_gekisou_partitions_match_exhaustive() {
     use ournotes_search::parallel::{self, Cancellation};
     let synth = synthetic_master(6, 1, 6);

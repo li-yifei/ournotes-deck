@@ -538,7 +538,7 @@ pub fn evaluate_luck_context(
     evaluate_orders(map, |order| luck_order(master, skills, input, order, curves.as_deref_mut()), cancelled)
 }
 
-fn luck_order(
+pub(crate) fn luck_order(
     master: &ournotes_sim::master::Master,
     skills: &ournotes_sim::live::full::LuckSkills,
     input: &super::expectation::FiniteSeedContext,
