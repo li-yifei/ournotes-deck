@@ -68,6 +68,38 @@ impl<'m> BuiltProblem<'m> {
     pub fn domain(&self) -> &CandidateDomain {
         &self.context.plan.domain
     }
+
+    /// Native partitions change only constraints and warm-start decks. Keep the
+    /// resolved pool/objective on its owning thread; rebuild domain-specific bounds.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn repartition(
+        &mut self,
+        constraints: &crate::search::Constraints,
+        initial_decks: &[DeckInput],
+    ) -> Result<(), Error> {
+        let ctx = &mut self.context;
+        let previous = std::mem::replace(&mut ctx.request.constraints, constraints.clone());
+        let plan = compile_execution(
+            &self.pool,
+            &ctx.request,
+            &ctx.spec.metric,
+            ctx.context_input.event_payoff.as_ref(),
+            ctx.spec.network_confirmations.as_deref(),
+            &ctx.spec.simulation,
+            &ctx.spec.strategy,
+        );
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                ctx.request.constraints = previous;
+                return Err(error);
+            }
+        };
+        ctx.spec.constraints = constraints.clone();
+        ctx.spec.initial_decks = initial_decks.to_vec();
+        ctx.plan = plan;
+        Ok(())
+    }
 }
 
 pub(crate) struct ExecutionPlan {
@@ -197,6 +229,26 @@ pub fn build_card_pool<'m>(
     roster: &Roster,
     r: &RecommendationRequest,
 ) -> Result<BuiltProblem<'m>, Error> {
+    build_card_pool_inner(data, roster, r, true)
+}
+
+/// Validate and resolve the original domain for native partitioning. Workers
+/// compile bounds for their actual domains after this preparation is discarded.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn prepare_partition_domain<'m>(
+    data: &'m DeckData,
+    roster: &Roster,
+    r: &RecommendationRequest,
+) -> Result<BuiltProblem<'m>, Error> {
+    build_card_pool_inner(data, roster, r, false)
+}
+
+fn build_card_pool_inner<'m>(
+    data: &'m DeckData,
+    roster: &Roster,
+    r: &RecommendationRequest,
+    compile_bounds: bool,
+) -> Result<BuiltProblem<'m>, Error> {
     // Explicitly unavailable in the unchanged current numerical core.
     reject_unsupported_lifecycle(r.network_confirmations.as_deref(), r.simulation.live_finished_from_frame)?;
 
@@ -284,7 +336,7 @@ pub fn build_card_pool<'m>(
         context_input.event_payoff.as_ref(),
         r.network_confirmations.as_deref(),
         &r.simulation,
-        &r.strategy,
+        if compile_bounds { &r.strategy } else { &Strategy::Exhaustive },
     )?;
     let route = match &r.strategy {
         Strategy::Exhaustive => SolverRoute::PhysicalExhaustive,

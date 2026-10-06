@@ -337,6 +337,11 @@ pub fn bonus_expected_prefix_upper(
     bounds.bonus_expected_upper(&built.pool, built.domain(), &p, depth, &MEAN_ORDERS, &mut scratch.bonus)
 }
 
+/// Drop request-local carrier envelopes/tables to audit cold/warm equivalence.
+pub fn reset_carrier_split_cache(built: &BuiltProblem<'_>) -> bool {
+    built.context.plan.joint.as_ref().is_some_and(|b| b.reset_carrier_split_cache())
+}
+
 /// Bound the leader-first prefix of a complete legal deck by every node bound of the joint traversal, as a payoff
 /// numerator; a complete deck (depth 5) also by the sum of its per-order caps. The caller independently enumerates
 /// completions and checks each one's numerator against this cap.

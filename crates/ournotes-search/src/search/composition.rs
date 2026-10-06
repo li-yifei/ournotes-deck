@@ -81,6 +81,10 @@ fn least_identity(p: &PhysicalDeck, depth: usize, e: &Engine<'_, '_>) -> ([i64; 
 }
 
 fn inferior(cap: i128, power: i64, p: Option<(&PhysicalDeck, usize)>, e: &Engine<'_, '_>) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::parallel::inferior(cap, power) {
+        return true;
+    }
     let Some((threshold, kth_power)) = e.safe_cutoff() else { return false };
     if cap != threshold || e.metric.secondary_priority().is_some() {
         return cap < threshold;
@@ -179,7 +183,7 @@ fn members(
     if missing.len() > 5 - depth || missing.iter().any(|m| !candidates[start..].contains(m)) {
         return Ok(true);
     }
-    if e.safe_cutoff().is_some() {
+    if e.has_pruning_cutoff() {
         e.tel.composition.composition.checks += 1;
         let (cap, power) = bounds.composition_expected_upper(e.pool, domain, p, depth, 0, true, orders)?;
         if inferior(cap, power, None, e) {
@@ -361,7 +365,7 @@ fn snaps(
     if depth == 5 && evaluated.contains(&p.snaps) {
         return Ok(true);
     }
-    if e.safe_cutoff().is_some() {
+    if e.has_pruning_cutoff() {
         e.tel.composition.team.checks += 1;
         let (cap, power) = bounds.composition_expected_upper(e.pool, domain, p, 5, depth, false, orders)?;
         if inferior(cap, power, Some((p, depth)), e) {

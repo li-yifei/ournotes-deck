@@ -49,6 +49,11 @@ fn visit(
         count.pruned += 1;
         return Ok(true);
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::parallel::inferior(bounds.primary_upper(power, e.metric)?, power) {
+        count.pruned += 1;
+        return Ok(true);
+    }
     if e.top.len() == e.request.k {
         let kth = e.top.last().expect("full exact Top-K");
         // Monotone primary then power has the same order as power alone. Equal
