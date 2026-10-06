@@ -122,6 +122,10 @@ pub(super) fn traversal_of(d: &PhysicalDeck, converting: &[usize]) -> (usize, us
 
 /// Whether (payoff cap, power cap) is strictly inferior to a full Top-K's cutoff (the traversal's prune rule).
 pub(super) fn inferior(cap: (i128, i64), e: &Engine<'_, '_>) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::parallel::inferior(cap.0, cap.1) {
+        return true;
+    }
     let Some((threshold, power)) = e.safe_cutoff() else { return false };
     cap.0 < threshold || (cap.0 == threshold && cap.1 < i64::from(power))
 }
@@ -332,6 +336,10 @@ impl Engine<'_, '_> {
 /// local search saw, then polishing rounds around the best deck. It stops when the budget runs out; the traversal
 /// after it then stops at its first deadline check.
 pub(super) fn seed(e: &mut Engine<'_, '_>) -> Result<(), Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::parallel::has_cutoff() {
+        return Ok(());
+    }
     let Some(w) = e.warm.take() else { return Ok(()) };
     e.rec.begin(&mut e.tel, "seed", None);
     let (_, resume) = e.rec.clock.lap(slot::WARM);
@@ -359,6 +367,10 @@ fn seed_inner(w: &Warm<'_>, e: &mut Engine<'_, '_>) -> Result<(), Error> {
     let mut shortlist = Shortlist { rows: Vec::new(), seen: HashSet::new() };
     let mut checks = 0u64;
     for leader in leaders {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::parallel::has_cutoff() {
+            return Ok(());
+        }
         if e.expired() {
             return Ok(());
         }
@@ -366,6 +378,10 @@ fn seed_inner(w: &Warm<'_>, e: &mut Engine<'_, '_>) -> Result<(), Error> {
         let mut current = uniform::canonical(e.pool, &current);
         let mut value = surrogate(w, &current, e)?;
         if !evaluate(w, value, current, false, e)? {
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::parallel::has_cutoff() {
             return Ok(());
         }
         shortlist.offer(value, current);
@@ -376,8 +392,14 @@ fn seed_inner(w: &Warm<'_>, e: &mut Engine<'_, '_>) -> Result<(), Error> {
                     break;
                 }
                 checks += 1;
-                if checks.is_multiple_of(64) && e.expired() {
-                    return Ok(());
+                if checks.is_multiple_of(64) {
+                    if e.expired() {
+                        return Ok(());
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if crate::parallel::has_cutoff() {
+                        return Ok(());
+                    }
                 }
                 let v = surrogate(w, &n, e)?;
                 shortlist.offer(v, n);

@@ -182,6 +182,16 @@ impl Engine<'_, '_> {
         }
         cache.insert((key, power), value.clone());
     }
+    /// A global exact cutoff can enable bound checks before this worker fills
+    /// its own Top-K. Keep local cutoff/identity APIs separate.
+    pub(super) fn has_pruning_cutoff(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::parallel::has_cutoff() {
+            return true;
+        }
+        self.safe_cutoff().is_some()
+    }
+
     /// Integer node threshold over 120 orders. On the certified frontier an equal node upper is closed only below
     /// the returned power (i32::MIN when no K candidates prove that tie); public-ID ties are not used.
     pub(super) fn safe_cutoff(&self) -> Option<(i128, i32)> {
