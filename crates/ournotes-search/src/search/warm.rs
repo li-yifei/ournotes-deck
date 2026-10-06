@@ -122,6 +122,10 @@ pub(super) fn traversal_of(d: &PhysicalDeck, converting: &[usize]) -> (usize, us
 
 /// Whether (payoff cap, power cap) is strictly inferior to a full Top-K's cutoff (the traversal's prune rule).
 pub(super) fn inferior(cap: (i128, i64), e: &Engine<'_, '_>) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::parallel::inferior(cap.0, cap.1) {
+        return true;
+    }
     let Some((threshold, power)) = e.safe_cutoff() else { return false };
     cap.0 < threshold || (cap.0 == threshold && cap.1 < i64::from(power))
 }
@@ -336,6 +340,10 @@ impl Engine<'_, '_> {
 /// POOL for bounded score targets, and min(K, DIVES) otherwise.
 /// The complete-domain traversal handles subsequent candidates.
 pub(super) fn seed(e: &mut Engine<'_, '_>) -> Result<(), Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::parallel::has_cutoff() {
+        return Ok(());
+    }
     let Some(w) = e.warm.take() else { return Ok(()) };
     e.rec.begin(&mut e.tel, "seed", None);
     let (_, resume) = e.rec.clock.lap(slot::WARM);
@@ -391,6 +399,10 @@ fn seed_inner(w: &Warm<'_>, e: &mut Engine<'_, '_>, deadline: Option<Instant>) -
     let mut shortlist = Shortlist { rows: Vec::new(), seen: HashSet::new() };
     let mut checks = 0u64;
     for leader in leaders {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::parallel::has_cutoff() {
+            return Ok(());
+        }
         if paused(e) {
             return Ok(());
         }
@@ -407,6 +419,10 @@ fn seed_inner(w: &Warm<'_>, e: &mut Engine<'_, '_>, deadline: Option<Instant>) -
         if certified_seed_complete(e) {
             return Ok(());
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::parallel::has_cutoff() {
+            return Ok(());
+        }
         shortlist.offer(value, current);
         while checks < SURROGATE_CHECKS {
             if paused(e) {
@@ -419,6 +435,10 @@ fn seed_inner(w: &Warm<'_>, e: &mut Engine<'_, '_>, deadline: Option<Instant>) -
                 }
                 checks += 1;
                 if paused(e) {
+                    return Ok(());
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if checks.is_multiple_of(64) && crate::parallel::has_cutoff() {
                     return Ok(());
                 }
                 let v = surrogate(w, &n, e)?;

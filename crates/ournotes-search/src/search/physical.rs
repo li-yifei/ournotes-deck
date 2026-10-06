@@ -223,6 +223,11 @@ impl Engine<'_, '_> {
     }
 
     fn expired(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::parallel::cancelled() {
+            self.stop = Some(ExitReason::TimeLimit);
+            return true;
+        }
         if self.stop.is_some() {
             return true;
         }
@@ -323,6 +328,11 @@ impl Engine<'_, '_> {
             self.stop = Some(ExitReason::CandidateLimit);
             return Ok(false);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !crate::parallel::visit() {
+            self.stop = Some(ExitReason::CandidateLimit);
+            return Ok(false);
+        }
         self.tel.leaves.visited += 1;
         let power = self.pool.deck_power(&physical.as_deck(), self.song, self.event)?.power();
         let evaluation = if self.live {
@@ -378,6 +388,10 @@ impl Engine<'_, '_> {
             .is_none_or(|best| entry.evaluation.expected_payoff.numerator > best.evaluation.expected_payoff.numerator);
         if pos < self.request.k {
             entry.terms = self.term_payoffs(&entry.physical, &entry.evaluation, entry.power)?;
+            #[cfg(not(target_arch = "wasm32"))]
+            if crate::parallel::sharing() {
+                crate::parallel::publish(entry.clone().wire(self.metric)?)?;
+            }
             self.top.insert(pos, entry);
             self.top.truncate(self.request.k);
             let (best, kth, filled) = self.standing();
