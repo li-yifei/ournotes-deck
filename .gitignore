@@ -2,3 +2,9 @@
 /work
 /tools/search-harness/target
 /tools/search-harness/__pycache__
+/resources/local/
+
+/adb-saves/
+/tools/save-decrypt/status.json
+__pycache__/
+*.pyc
