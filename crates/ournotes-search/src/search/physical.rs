@@ -24,6 +24,9 @@ mod leaf;
 use leaf::Leaf;
 #[path = "certified_engine.rs"]
 mod certified_engine;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "luck_seed.rs"]
+mod luck_seed;
 use certified_engine::CertifiedState;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1128,6 +1131,14 @@ pub(crate) fn solve_physical_impl(
         }
         match strategy {
             Strategy::Exhaustive | Strategy::BranchAndBound => {
+                #[cfg(not(target_arch = "wasm32"))]
+                let mut luck_screen = luck_seed::Screen::default();
+                #[cfg(not(target_arch = "wasm32"))]
+                if matches!(strategy, Strategy::BranchAndBound) && engine.certified.is_some() && !engine.expired() {
+                    engine.rec.begin(&mut engine.tel, "luckWarmStart", None);
+                    luck_seed::seed(&plan.domain, &mut engine, &mut luck_screen)?;
+                    engine.rec.end(&mut engine.tel);
+                }
                 let mut physical = PhysicalDeck { members: [0; 5], snaps: [None; 5] };
                 // The deck payoff ranking either settles the Top-K or hands the search to the joint traversal.
                 let mut joint_next = true;
@@ -1241,6 +1252,46 @@ pub(crate) fn solve_physical_impl(
                     engine.tel.environment.bounds.resource = engine.resource;
                 } else if joint_next {
                     engine.tel.environment.traversal = Traversal::Exhaustive;
+                    // A refused live bound otherwise starts with the first five IDs and empty Snaps.
+                    // Seed native LUCK searches with complete power teams, then retain the full traversal.
+                    // These are proposals only: the ordinary LUCK evaluator establishes their score intervals.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if matches!(strategy, Strategy::BranchAndBound) && engine.certified.is_some() && !engine.expired() {
+                        engine.rec.begin(&mut engine.tel, "fallbackWarmStart", None);
+                        let power = Objective::Power { music_id: None, event };
+                        let power = match request.objective.context() {
+                            Some(c) => power.in_scenario(c.clone()),
+                            None => Objective::Power { music_id: engine.song.as_ref().map(|s| s.id), event },
+                        };
+                        let seeds = super::search(
+                            pool,
+                            &SearchRequest {
+                                objective: power,
+                                k: 8,
+                                constraints: request.constraints.clone(),
+                                time_limit: Some(Duration::from_millis(
+                                    limits.time_limit_ms.map_or(1000, |ms| (ms / 4).min(1000)),
+                                )),
+                            },
+                        )?;
+                        for seed in seeds.results {
+                            if engine.expired() {
+                                break;
+                            }
+                            let deck = pool.deck(seed.members, seed.snaps, [0, 1, 2, 3, 4])?;
+                            let physical =
+                                uniform::canonical(pool, &PhysicalDeck { members: deck.members, snaps: deck.snaps });
+                            if !luck_screen.admit(&physical, false, &mut engine)? {
+                                continue;
+                            }
+                            engine.tel.incumbents.warm_start.evaluations += 1;
+                            if !engine.consider(physical)? {
+                                break;
+                            }
+                            engine.seeded.insert(physical);
+                        }
+                        engine.rec.end(&mut engine.tel);
+                    }
                     engine.rec.begin(&mut engine.tel, "search", None);
                     engine.rec.tracked = true;
                     members_rec(0, 0, &mut physical, candidates, required, leader, snaps, &mut engine)?;
