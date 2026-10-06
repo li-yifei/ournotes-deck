@@ -25,6 +25,7 @@ mod proof_telemetry;
 #[path = "fixtures/sustained_combo.rs"]
 mod sustained_combo;
 #[path = "fixtures/carrier_cache.rs"]
+#[cfg(feature = "search-diagnostics")]
 mod carrier_cache;
 
 fn joint_request(mode: &str, gekisou: bool, metric: Value) -> ournotes_search::types::RecommendationRequest {

@@ -31,9 +31,10 @@ request-local token; running atomic evaluations may complete before stopping.
 Unstarted parts keep the global result unproven. A partition's mutable caches
 are never reused as an authority for a different request.
 
-The first version parallelizes Power, Skip and ordinary Live, including Snap
-skills. Candidate strategy retains its original sequential proposal stream;
-gekisou/certified lottery requests retain their request-local serial frontier.
+The native path parallelizes Power, Skip, ordinary Live and deterministic
+Gekisou, including Snap skills. Candidate strategy retains its sequential
+proposal stream. Certified LUCK keeps a request-local serial frontier while
+parallelizing order scoring and exact-law refinement batches.
 These fallbacks are explicit in `telemetry.parallel.fallback`. Worker progress
 callbacks remain on the serial API in this version. The native FFI currently
 returns the final answer. WASM behavior remains unchanged.
@@ -248,3 +249,56 @@ checks used a temporary dataset with matching full-combo count, the local roster
 and no time limit; both binaries completed. The 4-thread synthetic result shows
 that this tuning is workload-dependent. Crossbeam remains deferred pending a
 measured need for dynamically redistributing long subtrees.
+
+
+## Gekisou and certified LUCK parallelism (2026-10-06)
+
+The resolved lottery mode selects the parallel layer. Absent/lottery-free
+Gekisou uses existing disjoint-domain search. Certified LUCK uses one proof
+coordinator and parallel batches of performance-order simulations. Outer search
+workers have a simulation allowance of one, preventing nested oversubscription.
+The coordinator participates in simulation work; an allowance N uses at most N
+active computation threads per batch. `simulationWorkerLimit` reports this
+allowance separately from `workersUsed`, which counts search-domain workers.
+
+Native-only `crossbeam-deque::Injector` distributes individual order jobs.
+Threads are scoped to each batch; this is not a persistent OS thread pool.
+Each mutable DP cache has one owner during a batch and is retained across
+candidate evaluations. The 32 MiB curve-key allowance is divided across the
+caches, not multiplied by the thread count. Completed orders are sorted into
+canonical input order before aggregation. A cancelled partial batch is discarded.
+Initial order scoring polls cancellation between orders; one atomic model run
+can finish before cancellation is observed.
+
+Exact-law refinement prefetches at most N orders. Before dispatch it divides
+remaining run/frame budgets among jobs; afterward it refunds unused allowances.
+Only completed laws are installed, sequentially through the existing interval
+frontier checks. Some prefetched laws can become unnecessary after an earlier
+law proves the ranking. Their computation is still charged to the request.
+Budget-limited convergence can differ from serial execution; exhaustion is never
+reported as a proof. Errors and cancellations preserve the existing proof rules.
+
+Three release measurements on the existing 31-team synthetic refinement witness
+(cache enabled), identical completed results at every thread count:
+
+| Threads | Median ms |
+| --- | ---: |
+| 1 | 1582.23 |
+| 2 | 1038.48 |
+| 4 | 542.20 |
+| 8 | 344.13 |
+
+In the first run, serial refinement performed 19,778 replays; eight threads
+performed 21,824, with the same 58 installed order refinements. These figures
+are synthetic evidence, not a claim about every real chart or three-LUCK speed.
+
+Regression coverage includes deterministic Gekisou versus exhaustive search,
+LUCK exact refinement and ranking parity at multiple thread counts, cache on/off,
+three separated LUCK ranges, cancellation/deadline behavior, global work ceilings,
+and batch ordering/exactly-once execution. The three-range fixture leaves room
+for each range's END/DELAY/COMPLETE/FINISH lifecycle. Overlapping unfinished
+LUCK ranges remain subject to the underlying model's explicit refusal.
+
+The existing model reads Gekisou member and support skills. A dedicated
+three-LUCK skill-match warm-start heuristic is separate future work; this
+parallel change does not introduce heuristic card exclusions.

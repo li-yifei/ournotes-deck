@@ -95,18 +95,51 @@ impl Engine<'_, '_> {
                 let skills = self.certified_luck_skills()?;
                 let mut curves = std::mem::take(&mut self.certified.as_mut().expect("certified request").luck_curves);
                 let (_, resume) = self.rec.clock.lap(slot::SIMULATION);
-                let result = crate::search::certified_search::evaluate_luck_context(
-                    master,
-                    &skills,
-                    &input,
-                    &crate::search::certified_search::PayoffMap::Score,
-                    Some(&mut curves),
-                    || self.expired(),
-                );
+                #[cfg(not(target_arch = "wasm32"))]
+                let parallel = if crate::parallel::simulation_workers() > 1 {
+                    Some(crate::search::certified_search::evaluate_luck_context_parallel(
+                        master,
+                        &skills,
+                        &input,
+                        &crate::search::certified_search::PayoffMap::Score,
+                        &mut self.certified.as_mut().expect("certified request").parallel_curves,
+                    ))
+                } else {
+                    None
+                };
+                #[cfg(target_arch = "wasm32")]
+                let parallel = None;
+                let result = parallel.unwrap_or_else(|| {
+                    crate::search::certified_search::evaluate_luck_context(
+                        master,
+                        &skills,
+                        &input,
+                        &crate::search::certified_search::PayoffMap::Score,
+                        Some(&mut curves),
+                        || self.expired(),
+                    )
+                });
                 self.rec.clock.lap(resume);
-                self.tel.caches.luck_curves.record(curves.stats());
+                let stats = curves.stats();
+                #[cfg(not(target_arch = "wasm32"))]
+                let stats = self.certified.as_ref().expect("certified request").parallel_curves.iter().fold(
+                    stats,
+                    |mut sum, cache| {
+                        let s = cache.stats();
+                        sum.lookups += s.lookups;
+                        sum.hits += s.hits;
+                        sum.evictions += s.evictions;
+                        sum.peak_entries += s.peak_entries;
+                        sum.peak_key_bytes += s.peak_key_bytes;
+                        sum.record_ms += s.record_ms;
+                        sum.propagate_ms += s.propagate_ms;
+                        sum
+                    },
+                );
+                self.tel.caches.luck_curves.record(stats);
                 self.certified.as_mut().expect("certified request").luck_curves = curves;
                 let Some(score) = result? else {
+                    self.expired();
                     return Ok(Leaf::Stopped);
                 };
                 self.tel.leaves.simulations += ORDERS as u64;
