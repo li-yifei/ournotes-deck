@@ -1,0 +1,21 @@
+{
+  "format": "ournotes.local/1",
+  "deckData": "nnnotes.deck-data/1",
+  "assetsDir": "assets",
+  "accountDir": "account",
+  "source": "local-export",
+  "files": [
+    {
+      "role": "deck-data",
+      "path": "nnnotes.deck-data/1",
+      "bytes": 0,
+      "sha256": ""
+    },
+    {
+      "role": "roster",
+      "path": "account/roster.json",
+      "bytes": 0,
+      "sha256": ""
+    }
+  ]
+}
