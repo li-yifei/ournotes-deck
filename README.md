@@ -150,6 +150,45 @@ for deck in &out.results {
 
 ## 命令行
 
+### 本地原生服务
+
+仓库还提供一个轻量本地 HTTP 服务。它启动时加载一次 deck data，之后每个请求由独立的原生线程处理，共享只读数据：
+
+```sh
+OURNOTES_DECK_DATA=/path/to/deck-data.json \
+OURNOTES_BIND=127.0.0.1:18766 \
+cargo run --release --bin ournotes-service
+```
+
+`GET /health` 返回服务状态。`POST /recommend` 接收 `{ "roster": {...}, "request": {...} }`，返回与 CLI 相同的推荐 JSON。服务只负责模型计算；ADB 存档需要先由外部工具导出为 `ournotes.account/1` 或 roster JSON，再提交给服务。
+
+### ADB 存档候选拉取
+
+`StarMoe-box` 的 Shizuku 实现通过 shell 身份读取 `Android/data/<package>/files/<hex>/`。桌面端可用同一目录规则运行候选文件拉取器：
+
+```sh
+cargo run --release --bin ournotes-adb-scan -- \
+  --package com.bushiroad.sirius --out ./adb-saves
+```
+
+它按 16 MiB 上限并行读取每个账号目录中的小文件，保存原始候选与旁车 JSON 元数据。拉取器输出加密候选与区服元数据；存档解密由持有本地凭据的桌面应用或 Android 工具完成。
+
+本地桌面应用与可选资源工具的说明见 [`docs/local-app-architecture.md`](docs/local-app-architecture.md)。`ournotes-ffi` 提供 `ournotes_recommend_json` 和基于 `ournotes.local/1` manifest 的 `ournotes_recommend_manifest_json` C ABI，另有 `ournotes_manifest_json` 用于解析 deck-data、assets、account 的本地路径；MyGo WebView 壳可以通过 Go FFI 调用 Rust 重计算模块。
+
+### 本地资源目录
+
+资源工具适用于自行处理本地数据的程序。当前 Mygo 壳加载 bdon 网页，由网页展示资料和图片，Rust 原生层计算、桌面层导入本机存档。以下资源暂存流程作为独立可选工具保留：
+
+```sh
+python3 tools/resources/stage.py \
+  --output resources/local \
+  --deck-data /path/to/deck-data.json \
+  --roster /path/to/roster.json \
+  --assets /path/to/extracted/assets
+```
+
+目录约定和 app 加载方式见 [`resources/README.md`](resources/README.md)。资源文件保持在 git 外部；`resources/local/manifest.json` 记录稳定相对路径和 SHA-256，MyGo 壳将资源根路径传给 Rust API。
+
 统一入口为 `ournotes-deck`。JSON 推荐请求使用 `recommend` 子命令：
 
 ```sh
