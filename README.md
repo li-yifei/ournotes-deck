@@ -180,75 +180,44 @@ ournotes-deck live  --data deck-data.json --roster box.json --score SCORE_ID --e
 ournotes-deck chart-stats --data deck-data.json [--seeds 8] [--charts ID,...] [--jobs N] -o chart-stats.json
 ```
 
-在整场模拟上实测每张谱面与卡组无关的量（`ournotes-deck.chart-stats/2`），分两种场景：激走开启（`seeds`，撃奏ライブ
-的打法）与激走关闭（`offSeeds`，自由 Live、挑战 Live 等单人 Live 的打法）。`--charts` 只测列出的 score id（按文件中的
-顺序输出，文件里没有的 id 忽略）；`--jobs N` 同时测 N 张谱面，输出与逐张测量完全相同。不给 `-o` 时输出到标准输出。
+谱面统计格式为 `ournotes-deck.chart-stats/3`。激走开启时给出各次抽签、技能判定按名义概率独立的期望，
+每个估计以 `[中心, 区间半宽]` 表示，包含概率运算和分数取整的外向误差界。打法为准点判定、Just 任务区间内 Just、
+其余 Perfect、每段名次 1；另测全 Perfect 打法。该概率模型与给定种子的单局回放分别计算。
+序列化分数中心保留三位小数，抽签次数保留五位，权重保留十二位；半宽在相同精度上向外取整，并包含中心的舍入误差。
 
-激走开启时打法为激走理论最佳：每个音符按准点判定，Just 任务区间内为 Just，其余为 Perfect，每个区间取名次 1。每个
-种子给出：无技能的精确得分；各激走区间的结果（`ranges`：区间得分、名次 1 加成、最大激走连击 `maxCombo`、Just 数
-`justCount`、幸运点数 `luckPoints`、抽签结果 `lotResults`；前三个计数分别是连击、Just、幸运任务的名次指标；无技能时幸运点数
-只来自幸运区间的抽签，其他区间为 0）；master 中每种加分效果（2000 / 2002 / 2004 / 2005，按类型、时长、目标、
-条件分组，见 `kinds`）在每个演出位上因子为 1 时的得分增量除以综合力（`weights[kind][k]`）。卡组得分约为
-`P × (score / power + Σ factor_k × weights[kind_k][k])`，每个种子都用 master 真实数值的随机卡组在另一综合力下实跑校验，
-偏差超出取整上限即报错。有幸运区间的谱面按前 N 个发布种子给出（`--seeds`，默认 8），这不是原生期望；超过三段 fever
-的谱面游戏会在第四段开始时出错，记为 `unplayable`（激走关闭时照常可玩）。
+`--charts` 选择 score id，按输入顺序输出；`--jobs N` 同时测 N 张谱面，结果与逐张测量相同。
+`--seeds N` 指定幸运谱面的回放种子数量，默认 8，与期望统计无关；没有幸运区间时回放种子为 `[0]`。
+`--no-gekisou-aptitude` 关闭单技能适性，保留基线统计。
 
-其他名次不重跑：名次加成为 `trunc(区间得分 × 百分比 / 100)`，记在区间结束帧的固定分上，不改因子也不改音符得分，所以
-区间 i 取名次 r_i 时无技能得分精确为 `score − Σ rankBonus_i + Σ trunc(rangeScore_i × rankBonusPercents_i[r_i − 1] / 100)`，
-权重为 `weights[kind][k] + Σ (rankBonusPercents_i[r_i − 1] − rankBonusPercents_i[0]) / 100 × rangeWeights[kind][k][i]`
-（`rangeWeights` 是该效果带来的区间得分增量除以综合力）。每个种子另用同一校验卡组在随机名次下走显式名次确认实跑校验
-（`rankCheck`）。条件读取确认名次（7012）的效果种类没有 `rangeWeights`，名次加成可能落进另一区间得分帧的谱面整张没有。
-每个种子还给出把 Just 全部改判 Perfect 的同一打法的无技能得分与各区间得分（`scorePerfect`、`rangeScorePerfect`）。
+每张谱面的 `expectation` 包含无技能 `score`、`scorePerfect`、区间结果、普通加分技能的 `weights[kind][position]`、
+`rangeWeights[kind][position][range]`，以及随机卡组的 `check` / 固定名次的 `rankCheck`。
+区间分数、名次奖励、幸运点数和四种抽签结果次数为期望区间；最大连击和 Just 数在证明与抽签独立后用整局模拟精确取得。
+`rankBonusPerfect` 是 Perfect 打法的名次奖励期望。超过三段 fever 时激走记为 `unplayable`、`expectation` 为 null；
+激走关闭的自由 Live 仍由 `offSeeds` 给出确定性分数和权重。
 
-激走关闭时打法为理论最佳（每个音符准点 Perfect），种子 0，没有 Just、幸运、激走连击和名次加成；给出同形的 `score`、
-`weights` 与校验。条件读取激走状态的效果种类在激走关闭时无法演出，其权重为 null。
+在不重叠、没有读取确定名次的条件的范围内，普通技能权重在其他名次下按
+`weight_r = weight + Σ (p_i(r_i) − p_i(1)) / 100 × rangeWeight_i` 变换。
+无技能总分为 `score − Σ rankBonus_i + Σ E[trunc(rangeScore_i × p_i(r_i) / 100)]`；
+期望奖励可由区间得分期望乘百分比并加取整余量包围，不能把期望中心截断当作奖励期望。
+每个 `check` 包含 `deck`、`ranks`、`expected`、`predicted`、`bound`，在另一综合力下用完整 DP 校验线性预测；
+两个区间端点的最大距离超过界限即报错。读取确定名次的 kind 没有线性区间权重。
 
+单技能适性由文件级 `gekisouAptitude` 的 `plainKind`、`host`、`law`、`shapes` 与每张谱面的 `factors`、`variants` 给出。
+形状按来源、任务与效果参数去重；成员技能取最高等级，小卡支援技能取最高突破的等级。
+仅差乐队目标的支援技能共享形状，保留各技能的成员目标和乐队，并分别测匹配、不匹配两种情况。
+支援技能使用同任务的合成空成员技能作为宿主。每次只带一个形状，增量由「有技能期望 − 无技能期望」得到。
 
-### 激走技能适性
+变体包含 `score`、`scorePerfect`、`tail`、`tailPerfect`、`converted`、各区间增量、普通 kind 的交叉权重和期望校验。
+全部数值用 `[中心, 区间半宽]` 表示；证明独立的计数半宽为 0。
+`tail = Δscore − Σ(ΔrangeScore + ΔrankBonus)` 包含技能延续到区间外的收益，Perfect 端使用对应 Perfect 字段。
+`factors.lotteries` 表示基线消耗的抽签次数期望。交叉权重测普通技能因子与该形状的相互作用。
 
-统计默认还给出单技能适性，不选择最佳编成，也不改变上面的 `seeds` / `offSeeds`。文件级 `gekisouAptitude` 是形状表和
-测量规则；每谱 `charts[].gekisouAptitude` 是谱面因子 `factors` 与该谱任务对应的变体 `variants`。没有激走区间、不能开
-激走或没有可测技能时，每谱字段为 null。格式仍是 `ournotes-deck.chart-stats/2`，这些都是新增字段。
+多个形状的增量不能相加来估计完整编成，连击封顶、幸运槽、Rush 与 Just 触发会互相影响。
+普通技能的交叉权重只测最佳打法；低于 100% Just 时仅能插值无普通技能的 Just / Perfect 端点。
+Just 率插值和 Great 比例缩放是统计摘要的近似使用方式，完整逐音符结果通过共享 `replay` API 按帧和种子计算。
 
-```sh
-ournotes-deck chart-stats --data deck-data.json --aptitude-max-seeds 128 --aptitude-cross-seeds 32 -o stats.json
-ournotes-deck chart-stats --data deck-data.json --no-gekisou-aptitude -o baseline.json
-```
-
-- `--aptitude-max-seeds N`：随机增量最多测 N 个种子，默认 65536，N 至少为 2；两个判定端均达到标准误目标时提前停止。
-- `--aptitude-cross-seeds N`：普通技能交叉项最多测前 N 个种子，默认 64，N 至少为 1。
-- `--no-gekisou-aptitude`：跳过适性测量，文件级和每谱的 `gekisouAptitude` 都为 null，原有统计照常输出。
-
-形状按来源、任务与效果参数去重。成员技能取该技能的最高等级；小卡技能取最高突破对应的等级，不直接取效果表最高等级。
-支援技能仅差乐队目标时归为同一形状，保留 `skills[].memberTargetIds` / `bandIds`；每谱分别测 `bandMatch: true/false`。
-支援技能的宿主统一使用同任务的**合成空激走技能**，不借真卡，不混入成员技能收益。每次只带一个成员或支援技能，整局实跑。
-
-变体的 `score`、`scorePerfect`、`tail`、区间增量等均为 `[均值, 均值标准误]`，是同种子下「带技能 − 不带技能」的差，
-综合力固定为 `model.power`。`tail = Δscore − Σ(ΔrangeScore + ΔrankBonus)` 表示区间外收益，包含技能延续到区间结束后的
-尾部；`factors` 给出各区间音符数、进入时连击和基线抽签次数，用来解释适性。`weights` 是普通技能 `plainKind` 各位置权重
-的变化，`rangeWeights` 是对应区间权重变化；不是完整编成权重，没有普通 kind 时两者为 null。每个变体的 `check` 用首个
-测量种子、随机名次与随机普通技能卡组，在另一综合力下验证线性预测，超出取整界时报错。
-
-随机增量从 32 个种子起按同一 seed 前缀倍增，按配置的最大种子数停止；预设批次延伸至 65536，非批次边界的上限另作为最后一批。`score` 与 `scorePerfect` 分别使用
-各自的增量均值和无技能总分基线；两者的标准误均不超过 `max(增量均值绝对值 × 1%, 无技能总分均值 × 0.1%)` 才停止。
-到上限仍不满足则 `seTargetMet: false`。确定性增量报一个
-种子、标准误 0；四个种子恰好相等本身不能证明随机技能是确定性的。种子均值不是游戏的期望，真实种子分布未知，标准误也
-不表示模型误差。交叉项可能使用更少种子，见各变体的 `crossSeeds`；无普通 kind 时该值为 0。达到标准误目标可能只是满足基线 0.1%的绝对目标，不代表达到增量 1%的相对精度，也不能据小增量均值的正负断言技能一定有益或有害。
-
-**模型边界：**
-
-- 只影响撃奏ライブ的 `battleLiveScore`，不影响另行上报的 `soloScore`，自由 Live 不加适性收益。
-- 只测单技能，**多个技能增量不能相加**：激走连击封顶、幸运槽与 rush 支援交互、Just 数改变相关支援触发等都会破坏可加性。
-- 理论最佳打法没有 Great / Miss，12004 连击保护、12006 Great→Perfect、4004 判定窗扩大在此为零；13000 / 13002
-  Just 数加成与 11002 幸运点数加成可改变区间指标，但不直接增加得分。任务不符的形状因门控为零，不列进该谱变体。
-- 普通技能倍率与名次沿用线性式，名次增量每区间有取整差，由 `check` 验证。Just 率不足 100% 时，仅能给出无普通技能增量的 Just / Perfect 插值估计，
-  13005 转换、每 Just 的 2001 支援及 13002 的 Just 数变化不能按比例精确缩放。未测 Perfect 打法的交叉权重，因此普通技能非零时不提供低于 100% Just 的完整适性；Great 比例乘 `1 − 0.2q` 也只是近似。
-
-以上插值与缩放描述统计摘要的使用边界。给定逐音符判定的单局结果使用共享 `replay` API，按实际帧序、技能与 seed 运行模型；见[计算契约](docs/native-validation.md#共用模型的计算契约)。
-
-库调用可用 `chart_stats_with` / `document_with` 与
-`Options { seeds, aptitude: Some(AptitudeOptions { max_seeds, cross_seeds }) }`；`aptitude: None` 关闭适性。
-不含谱面的 `DeckData` 也可以生成形状表，或直接调用 `aptitude_header(master, kinds, options)`。
+库调用使用 `chart_stats_with` / `document_with` 与 `Options { replay_seeds, aptitude }`。
+`aptitude: false` 关闭适性；无谱面的输入也可生成形状表，或调用 `aptitude_header(master, kinds)`。
 
 ## 测试
 

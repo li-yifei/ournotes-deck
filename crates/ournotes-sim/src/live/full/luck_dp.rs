@@ -13,7 +13,7 @@
 
 use super::gekisou::{LotteryMachine, LuckScore, M_LUCK, S_COMPLETE, S_END, S_FINISH, S_PLAYING, S_START};
 use super::*;
-use crate::live::certified::ProbabilityMass;
+use crate::live::certified::{F64Interval, ProbabilityMass};
 use crate::num::{FxHashMap, floor_to_i32};
 
 /// A complete nominal lottery curve and the size of its sparse computation.
@@ -33,13 +33,30 @@ pub struct LuckDpCertifiedResult {
     pub steps: Vec<(i32, [ProbabilityMass; 4])>,
     /// All supported score probes use the same 7021 predicate; this identifies the shapes with a holder.
     pub probes: Vec<bool>,
+    /// Optional additive indicators, one per range when requested; empty for score-only curves.
+    pub range_moments: Vec<LuckRangeMoments>,
     pub peak_states: usize,
     pub transitions: u64,
+}
+
+/// Expectations of additive lottery indicators under the independent nominal law.
+#[derive(Clone, Copy, Debug)]
+pub struct LuckRangeMoments {
+    pub luck_points: F64Interval,
+    /// Expected result counts in Miss, Hit, Super Hit, Critical order.
+    pub lot_results: [F64Interval; 4],
+}
+
+impl Default for LuckRangeMoments {
+    fn default() -> Self {
+        Self { luck_points: F64Interval::ZERO, lot_results: [F64Interval::ZERO; 4] }
+    }
 }
 
 struct DpResult<W> {
     steps: Vec<(i32, W)>,
     probes: Vec<bool>,
+    range_moments: Vec<LuckRangeMoments>,
     peak_states: usize,
     transitions: u64,
 }
@@ -90,6 +107,8 @@ struct State {
     previous_miss: bool,
     frame_lot: bool,
     frame_miss: bool,
+    previous_critical: bool,
+    frame_critical: bool,
     rush: bool,
     /// Chart-time rush while scanning this frame's note times. A FINISH disable at frame time must not
     /// remove the rush from earlier chart times in that same frame.
@@ -117,6 +136,9 @@ impl std::hash::Hash for State {
                 | ((self.score as u32) << 30)
                 | ((self.score_before as u32) << 31),
         );
+        if self.previous_critical || self.frame_critical {
+            hasher.write_u8(u8::from(self.previous_critical) | (u8::from(self.frame_critical) << 1));
+        }
     }
 }
 
@@ -136,6 +158,7 @@ trait Mass: Copy {
     fn possible(self) -> bool;
     /// The value's bit pattern; equal patterns mean equal values.
     fn bits(self) -> [u64; 2];
+    fn interval(self) -> F64Interval;
     fn bonus(machine: &LotteryMachine, kind: usize, buff: i32, minimum: i8) -> Result<Vec<(Self, i64)>, Error>;
     fn base(machine: &LotteryMachine, note_type: i32, judgement: i32) -> Result<Vec<(Self, i64)>, Error>;
     fn weights(dist: &Distribution<Self>, probes: &[bool], at_frame: bool) -> Self::Weights;
@@ -168,6 +191,10 @@ impl Mass for f64 {
 
     fn bits(self) -> [u64; 2] {
         [self.to_bits(), 0]
+    }
+
+    fn interval(self) -> F64Interval {
+        F64Interval::point(self).expect("finite nominal mass")
     }
 
     fn bonus(machine: &LotteryMachine, kind: usize, buff: i32, minimum: i8) -> Result<Vec<(Self, i64)>, Error> {
@@ -245,6 +272,10 @@ impl Mass for ProbabilityMass {
         [self.interval().lower().to_bits(), self.interval().upper().to_bits()]
     }
 
+    fn interval(self) -> F64Interval {
+        ProbabilityMass::interval(self)
+    }
+
     fn bonus(machine: &LotteryMachine, kind: usize, buff: i32, minimum: i8) -> Result<Vec<(Self, i64)>, Error> {
         certified_weights(machine.bonus_probability_weights(kind, buff, i64::from(minimum))?)
     }
@@ -297,6 +328,8 @@ enum Action<M> {
     StartGauge { value: i64, chance: M },
     StartMinimum { result: i8, chance: M },
     MissGauge { value: i64 },
+    CriticalPoints { value: i32, chance: M },
+    StartPoints { value: i32, chance: M },
 }
 
 struct Plan<M> {
@@ -528,6 +561,7 @@ fn compile<M: Mass>(
     model: &mut LiveModel,
     skills: &LuckSkills,
     probes: Option<&[Option<usize>]>,
+    collect_moments: bool,
 ) -> Result<Plan<M>, Error> {
     let mut plan = Plan::default();
     for condition in &model.cond {
@@ -580,6 +614,9 @@ fn compile<M: Mass>(
             let miss = matches!(effect.trigger.as_ref(), Some(Checker::LuckLotResult { target: 0, .. }));
             let critical = matches!(effect.trigger.as_ref(), Some(Checker::LuckLotResult { target: 3, .. }));
             let rush = matches!(effect.trigger.as_ref(), Some(Checker::LuckRushPlaying(_)));
+            if row.effect_type == 11002 && !collect_moments {
+                continue;
+            }
             match row.effect_type {
                 11001 => {
                     let timed = start && effect.trigger_type == ONE_SHOT && effect.act > 0.0 && release.is_none();
@@ -645,6 +682,21 @@ fn compile<M: Mass>(
                         plan.actions.push((effect.phase, Action::MissGauge { value: row.effect_value }, None));
                     }
                 }
+                11002 if start => {
+                    if effect.trigger_type != ONE_SHOT
+                        || effect.act != 0.0
+                        || effect.execute_limit != 0
+                        || effect.reset.is_some()
+                        || !(release.is_none() || complete(release))
+                    {
+                        return Err(fail("an unknown range-start bonus-point shape"));
+                    }
+                    plan.actions.push((
+                        effect.phase,
+                        Action::StartPoints { value: row.effect_value as i32, chance: mass },
+                        effect.condition.clone(),
+                    ));
+                }
                 11002 if critical => {
                     if effect.trigger_type != ONE_SHOT
                         || effect.act != 0.0
@@ -652,10 +704,15 @@ fn compile<M: Mass>(
                         || effect.execute_limit != 0
                         || effect.reset.is_some()
                         || !matches!(probability, 0.0 | 1.0)
+                        || effect.condition.as_ref().is_some_and(|checker| fixed_condition(checker).is_none())
                     {
                         return Err(fail("an unknown Critical bonus-point shape"));
                     }
-                    // This only changes rank bonus points; no accepted condition reads them.
+                    plan.actions.push((
+                        effect.phase,
+                        Action::CriticalPoints { value: row.effect_value as i32, chance: mass },
+                        effect.condition.clone(),
+                    ));
                 }
                 2000 | 2005 if rush => {
                     if effect.trigger_type != SUSTAINED
@@ -701,13 +758,21 @@ struct Dp<'a, M: Mass> {
     spare: Distribution<M>,
     peak: usize,
     transitions: u64,
+    range_moments: Vec<LuckRangeMoments>,
+    track_critical: bool,
 }
 
 impl<'a, M: Mass> Dp<'a, M> {
-    fn new(templates: Vec<LuckScore>, machine: &'a LotteryMachine) -> Self {
+    fn new(templates: Vec<LuckScore>, machine: &'a LotteryMachine, collect_moments: bool) -> Self {
         let mut dist = Distribution::<M>::default();
         dist.insert(State::default(), M::ONE);
         Self {
+            range_moments: if collect_moments {
+                vec![LuckRangeMoments::default(); templates.len()]
+            } else {
+                Vec::new()
+            },
+            track_critical: false,
             templates,
             active_range: None,
             machine,
@@ -752,6 +817,16 @@ impl<'a, M: Mass> Dp<'a, M> {
 
     fn action(&mut self, action: Action<M>, target: usize) -> Result<(), Error> {
         debug_assert_eq!(self.active_range, Some(target));
+        if let Action::CriticalPoints { value, chance } | Action::StartPoints { value, chance } = action {
+            let mass = self
+                .dist
+                .iter()
+                .filter(|(state, _)| matches!(action, Action::StartPoints { .. }) || state.previous_critical)
+                .fold(M::ZERO, |sum, (_, &probability)| sum.merge(probability));
+            let points = mass.multiply(chance).interval().multiply(F64Interval::integer(i128::from(value)));
+            self.range_moments[target].luck_points = self.range_moments[target].luck_points.add(points);
+            return Ok(());
+        }
         let mut out = std::mem::take(&mut self.spare);
         let mut previous = std::mem::take(&mut self.dist);
         for (state, probability) in previous.drain() {
@@ -775,6 +850,7 @@ impl<'a, M: Mass> Dp<'a, M> {
                     next.chain = Chain::of(&score);
                     if let Action::StartGauge { chance, .. } = action { chance } else { M::ONE }
                 }
+                Action::CriticalPoints { .. } | Action::StartPoints { .. } => unreachable!(),
             };
             self.push(&mut out, next, probability.multiply(chance))?;
             let complement = chance.complement();
@@ -820,9 +896,17 @@ impl<'a, M: Mass> Dp<'a, M> {
                 next.query_rush = next.rush;
             }
             score.add_score(result)?;
+            if let Some(moments) = self.range_moments.get_mut(range) {
+                let mass = p.multiply(pn).interval();
+
+                moments.lot_results[result as usize] = moments.lot_results[result as usize].add(mass);
+                let points = if result == 0 { 0 } else { super::gekisou::BONUS_POINT_BY_RESULT[result as usize - 1] };
+                moments.luck_points = moments.luck_points.add(mass.multiply(F64Interval::integer(i128::from(points))));
+            }
             next.chain = Chain::of(&score);
             next.frame_lot = true;
             next.frame_miss |= result == 0;
+            next.frame_critical |= self.track_critical && result == 3;
             let draws = self.draw(score.current_lot_type(), buff, next.minimum)?;
             next.minimum = 0;
             for (pr, result) in draws.iter() {
@@ -994,8 +1078,20 @@ pub fn luck_rush_dp_with_ranking(
     probes: Option<&[Option<usize>]>,
     ranking: Option<&[crate::replay::RankConfirmation]>,
 ) -> Result<LuckDpResult, Error> {
-    let result =
-        run::<f64>(master, skills, notes, skill_events, params, setup, play, delta_times, deck, probes, ranking)?;
+    let result = run::<f64>(
+        master,
+        skills,
+        notes,
+        skill_events,
+        params,
+        setup,
+        play,
+        delta_times,
+        deck,
+        probes,
+        ranking,
+        false,
+    )?;
     Ok(LuckDpResult { steps: result.steps, peak_states: result.peak_states, transitions: result.transitions })
 }
 
@@ -1062,6 +1158,42 @@ pub fn luck_rush_dp_certified_with_ranking(
     probes: Option<&[Option<usize>]>,
     ranking: Option<&[crate::replay::RankConfirmation]>,
 ) -> Result<LuckDpCertifiedResult, Error> {
+    certified_mode(master, skills, notes, skill_events, params, setup, play, delta_times, deck, probes, ranking, false)
+}
+
+/// Certified curve with expected additive range points and consumed result counts.
+#[allow(clippy::too_many_arguments)]
+pub fn luck_rush_dp_certified_with_moments(
+    master: &Master,
+    skills: &LuckSkills,
+    notes: &[LiveNote],
+    skill_events: &[(i32, i32)],
+    params: LiveParams,
+    setup: &GekisouSetup,
+    play: &LivePlay,
+    delta_times: &[f32],
+    deck: &[Performer],
+    probes: Option<&[Option<usize>]>,
+    ranking: Option<&[crate::replay::RankConfirmation]>,
+) -> Result<LuckDpCertifiedResult, Error> {
+    certified_mode(master, skills, notes, skill_events, params, setup, play, delta_times, deck, probes, ranking, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn certified_mode(
+    master: &Master,
+    skills: &LuckSkills,
+    notes: &[LiveNote],
+    skill_events: &[(i32, i32)],
+    params: LiveParams,
+    setup: &GekisouSetup,
+    play: &LivePlay,
+    delta_times: &[f32],
+    deck: &[Performer],
+    probes: Option<&[Option<usize>]>,
+    ranking: Option<&[crate::replay::RankConfirmation]>,
+    collect_moments: bool,
+) -> Result<LuckDpCertifiedResult, Error> {
     let result = run::<ProbabilityMass>(
         master,
         skills,
@@ -1074,10 +1206,12 @@ pub fn luck_rush_dp_certified_with_ranking(
         deck,
         probes,
         ranking,
+        collect_moments,
     )?;
     Ok(LuckDpCertifiedResult {
         steps: result.steps,
         probes: result.probes,
+        range_moments: result.range_moments,
         peak_states: result.peak_states,
         transitions: result.transitions,
     })
@@ -1096,6 +1230,7 @@ fn run<M: Mass>(
     deck: &[Performer],
     probes: Option<&[Option<usize>]>,
     ranking: Option<&[crate::replay::RankConfirmation]>,
+    collect_moments: bool,
 ) -> Result<DpResult<M::Weights>, Error> {
     propagate(&record::<M>(
         master,
@@ -1109,6 +1244,7 @@ fn run<M: Mass>(
         deck,
         probes,
         ranking,
+        collect_moments,
     )?)
 }
 
@@ -1116,6 +1252,7 @@ fn run<M: Mass>(
 /// deterministic life recorder. [`propagate`] is a function of this value alone: equal transcripts give the same
 /// curve, bit for bit.
 struct Transcript<M> {
+    collect_moments: bool,
     templates: Vec<LuckScore>,
     machine: LotteryMachine,
     /// One flag per range: whether it is a Luck range.
@@ -1193,6 +1330,14 @@ fn action_words<M: Mass>(action: &Action<M>) -> [u64; 4] {
             [1, u64::from(result as u8), lower, upper]
         }
         Action::MissGauge { value } => [2, value as u64, 0, 0],
+        Action::CriticalPoints { value, chance } => {
+            let [lower, upper] = chance.bits();
+            [3, u64::from(value as u32), lower, upper]
+        }
+        Action::StartPoints { value, chance } => {
+            let [lower, upper] = chance.bits();
+            [4, u64::from(value as u32), lower, upper]
+        }
     }
 }
 
@@ -1238,11 +1383,27 @@ impl<M: Mass> Transcript<M> {
     /// Every field as words (binary32 and binary64 values by bit pattern, every list after its length), or None
     /// for a failed recording. Equal words mean equal transcripts.
     fn key(&self) -> Option<Vec<u64>> {
-        let Self { templates, machine, luck, probes, miss_rows, frames, notes, hits, actions, pending, failure } = self;
+        let Self {
+            collect_moments,
+            templates,
+            machine,
+            luck,
+            probes,
+            miss_rows,
+            frames,
+            notes,
+            hits,
+            actions,
+            pending,
+            failure,
+        } = self;
         if failure.is_some() {
             return None;
         }
         let mut out = Vec::with_capacity(64 + 4 * frames.len() + 4 * notes.len() + 4 * hits.len() + 4 * actions.len());
+        if *collect_moments {
+            out.push(0x6d6f6d656e747331);
+        }
         out.push(templates.len() as u64);
         templates.iter().for_each(|template| template.push_words(&mut out));
         machine.push_words(&mut out);
@@ -1361,10 +1522,26 @@ fn record<M: Mass>(
     deck: &[Performer],
     probes: Option<&[Option<usize>]>,
     ranking: Option<&[crate::replay::RankConfirmation]>,
+    collect_moments: bool,
 ) -> Result<Transcript<M>, Error> {
     timed(
         |p| &mut p.total_ms,
-        || record_frames(master, skills, notes, skill_events, params, setup, play, delta_times, deck, probes, ranking),
+        || {
+            record_frames(
+                master,
+                skills,
+                notes,
+                skill_events,
+                params,
+                setup,
+                play,
+                delta_times,
+                deck,
+                probes,
+                ranking,
+                collect_moments,
+            )
+        },
     )
 }
 
@@ -1381,6 +1558,7 @@ fn record_frames<M: Mass>(
     deck: &[Performer],
     probes: Option<&[Option<usize>]>,
     ranking: Option<&[crate::replay::RankConfirmation]>,
+    collect_moments: bool,
 ) -> Result<Transcript<M>, Error> {
     // Initial/precomputed draws choose `next` without adding score. Each consumed result calls add_score
     // once; non-overlapping Luck ranges consume at most once per note plus one pending result per frame.
@@ -1413,7 +1591,7 @@ fn record_frames<M: Mass>(
     if let Some(ranking) = ranking {
         model.set_rank_confirmation_timeline(ranking)?;
     }
-    let plan = compile::<M>(master, &mut model, skills, probes)?;
+    let plan = compile::<M>(master, &mut model, skills, probes, collect_moments)?;
     count(|p| &mut p.calls);
     if model.cond.is_empty() {
         count(|p| &mut p.without_skills);
@@ -1437,6 +1615,7 @@ fn record_frames<M: Mass>(
     let note_map: FxHashMap<_, _> = notes.iter().map(|note| (note.note_id, note)).collect();
     let Plan { actions, probes: probe_flags } = plan;
     let mut transcript = Transcript {
+        collect_moments,
         templates,
         machine,
         luck: ranges.iter().map(|range| range.2 == M_LUCK).collect(),
@@ -1571,6 +1750,12 @@ fn record_frame<M: Mass>(
                     out.actions.push(Action::StartMinimum { result, chance: mass })
                 }
                 Action::MissGauge { value } => out.actions.push(Action::MissGauge { value }),
+                Action::CriticalPoints { value, .. } => {
+                    out.actions.push(Action::CriticalPoints { value, chance: mass })
+                }
+                Action::StartPoints { value, .. } if start.is_some() => {
+                    out.actions.push(Action::StartPoints { value, chance: mass })
+                }
                 _ => {}
             }
         }
@@ -1600,7 +1785,34 @@ fn record_frame<M: Mass>(
 /// Propagate the lottery-state distribution through a transcript.
 fn propagate<M: Mass>(transcript: &Transcript<M>) -> Result<DpResult<M::Weights>, Error> {
     let t = transcript;
-    let mut dp = Dp::<M>::new(t.templates.clone(), &t.machine);
+    let mut dp = Dp::<M>::new(t.templates.clone(), &t.machine, t.collect_moments);
+    dp.track_critical = t.actions.iter().any(|a| matches!(a, Action::CriticalPoints { .. }));
+    // Each note hit and each pending frame consumes at most one result. Critical point commands fire at
+    // most once per recorded action. These bounds prove that additive indicators cannot wrap native i32.
+    if t.collect_moments {
+        let draws = t.hits.len() as i128 + t.frames.iter().map(|f| i128::from(f.repeat)).sum::<i128>();
+        let mut lower = 0i128;
+        let mut upper = 10 * draws;
+        let mut from = 0;
+        for frame in &t.frames {
+            for action in &t.actions[from..frame.actions] {
+                if let Action::CriticalPoints { value, chance } | Action::StartPoints { value, chance } = *action
+                    && chance.possible()
+                {
+                    let value = i128::from(value) * i128::from(frame.repeat);
+                    lower += value.min(0);
+                    upper += value.max(0);
+                }
+            }
+            from = frame.actions;
+        }
+        if t.templates.iter().any(|s| {
+            i128::from(s.total_bonus_point) + lower < i128::from(i32::MIN)
+                || i128::from(s.total_bonus_point) + upper > i128::from(i32::MAX)
+        }) {
+            return Err(Error::Unsupported("LUCK DP: additive lottery points may wrap".into()));
+        }
+    }
     let mut steps: Vec<(i32, M::Weights)> = Vec::new();
     let mut previous_lot = false;
     let mut queued = vec![false; t.luck.len()];
@@ -1637,6 +1849,7 @@ fn propagate<M: Mass>(transcript: &Transcript<M>) -> Result<DpResult<M::Weights>
                 state.score_before = state.score;
                 state.frame_lot = false;
                 state.frame_miss = false;
+                state.frame_critical = false;
                 if finish {
                     state.rush = false;
                 }
@@ -1699,9 +1912,11 @@ fn propagate<M: Mass>(transcript: &Transcript<M>) -> Result<DpResult<M::Weights>
             previous_lot = dp.dist.keys().any(|state| state.frame_lot);
             dp.map(|mut state| {
                 state.previous_miss = state.frame_miss;
+                state.previous_critical = state.frame_critical;
                 state.query_rush = state.rush;
                 state.score_before = state.score;
                 state.frame_miss = false;
+                state.frame_critical = false;
                 state.frame_lot = false;
                 if finish {
                     state.chain = Chain::default();
@@ -1720,7 +1935,13 @@ fn propagate<M: Mass>(transcript: &Transcript<M>) -> Result<DpResult<M::Weights>
     if let Some(failure) = &t.failure {
         return Err(failure.clone());
     }
-    Ok(DpResult { steps, probes: t.probes.clone(), peak_states: dp.peak, transitions: dp.transitions })
+    Ok(DpResult {
+        steps,
+        probes: t.probes.clone(),
+        range_moments: dp.range_moments,
+        peak_states: dp.peak,
+        transitions: dp.transitions,
+    })
 }
 
 /// Certified curves reused within one request, across performance orders and decks.
@@ -1789,6 +2010,70 @@ impl LuckDpCache {
         probes: Option<&[Option<usize>]>,
         ranking: Option<&[crate::replay::RankConfirmation]>,
     ) -> Result<std::sync::Arc<LuckDpCertifiedResult>, Error> {
+        self.certified_mode(
+            master,
+            skills,
+            notes,
+            skill_events,
+            params,
+            setup,
+            play,
+            delta_times,
+            deck,
+            probes,
+            ranking,
+            false,
+        )
+    }
+
+    /// Cached certified curve with additive range indicators.
+    #[allow(clippy::too_many_arguments)]
+    pub fn certified_with_moments(
+        &mut self,
+        master: &Master,
+        skills: &LuckSkills,
+        notes: &[LiveNote],
+        skill_events: &[(i32, i32)],
+        params: LiveParams,
+        setup: &GekisouSetup,
+        play: &LivePlay,
+        delta_times: &[f32],
+        deck: &[Performer],
+        probes: Option<&[Option<usize>]>,
+        ranking: Option<&[crate::replay::RankConfirmation]>,
+    ) -> Result<std::sync::Arc<LuckDpCertifiedResult>, Error> {
+        self.certified_mode(
+            master,
+            skills,
+            notes,
+            skill_events,
+            params,
+            setup,
+            play,
+            delta_times,
+            deck,
+            probes,
+            ranking,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn certified_mode(
+        &mut self,
+        master: &Master,
+        skills: &LuckSkills,
+        notes: &[LiveNote],
+        skill_events: &[(i32, i32)],
+        params: LiveParams,
+        setup: &GekisouSetup,
+        play: &LivePlay,
+        delta_times: &[f32],
+        deck: &[Performer],
+        probes: Option<&[Option<usize>]>,
+        ranking: Option<&[crate::replay::RankConfirmation]>,
+        collect_moments: bool,
+    ) -> Result<std::sync::Arc<LuckDpCertifiedResult>, Error> {
         #[cfg(feature = "search-diagnostics")]
         let started = std::time::Instant::now();
         let transcript = record::<ProbabilityMass>(
@@ -1803,6 +2088,7 @@ impl LuckDpCache {
             deck,
             probes,
             ranking,
+            collect_moments,
         );
         let key = transcript.as_ref().ok().and_then(|transcript| transcript.key());
         #[cfg(feature = "search-diagnostics")]
@@ -1828,6 +2114,7 @@ impl LuckDpCache {
         let result = std::sync::Arc::new(LuckDpCertifiedResult {
             steps: result.steps,
             probes: result.probes,
+            range_moments: result.range_moments,
             peak_states: result.peak_states,
             transitions: result.transitions,
         });
@@ -2044,6 +2331,185 @@ mod tests {
                 assert!(dp.peak_states >= 1 && dp.transitions > 0);
             }
         }
+    }
+
+    #[test]
+    fn range_moments_match_complete_lottery_indicators_and_critical_skills() {
+        for result in 0..4 {
+            let (mut master, notes, params, mut setup, play, delta) = fixture(result, 60);
+            master.skill_conditions.push(
+                serde_json::from_value(json!({
+                    "_id": 7003, "_conditionType": 7000, "_conditionValues": [3],
+                    "_conditionTargetIDs": [], "_isPositive": true,
+                }))
+                .unwrap(),
+            );
+            master.skill_condition_sets.push(
+                serde_json::from_value(json!({
+                    "_id": 7, "_group": 7003, "_conditionIds": [7003],
+                }))
+                .unwrap(),
+            );
+            master.gekisou_support_skills.push(crate::master::SkillRow {
+                id: 77,
+                gekisou_mission_type: 2,
+                ..Default::default()
+            });
+            master
+                .gekisou_support_skill_effects
+                .push(serde_json::from_value(row(77, "_gekisouSupportSkillID", 77, 11002, 7, 7003, 0, 0)).unwrap());
+            master.reindex().unwrap();
+            setup.fevers = vec![(100, 300), (1100, 1200)];
+            let deck = [Performer {
+                gekisou_skill: Some((2, 1)),
+                gekisou_mission_type: 2,
+                gekisou_support_skills: vec![(77, 1)],
+                ..Default::default()
+            }];
+            let skills = luck_skills(&master).unwrap();
+            let dp = luck_rush_dp_certified_with_moments(
+                &master,
+                &skills,
+                &notes,
+                &[],
+                params,
+                &setup,
+                &play,
+                &delta,
+                &deck,
+                None,
+                None,
+            )
+            .unwrap();
+            let compact =
+                luck_rush_dp_certified(&master, &skills, &notes, params, &setup, &play, &delta, &deck, None).unwrap();
+            assert!(compact.range_moments.is_empty());
+            let mut plain = master.clone();
+            plain.gekisou_support_skill_effects.retain(|row| row.skill_id != 77);
+            plain.reindex().unwrap();
+            let without = luck_rush_dp_certified(
+                &plain,
+                &luck_skills(&plain).unwrap(),
+                &notes,
+                params,
+                &setup,
+                &play,
+                &delta,
+                &deck,
+                None,
+            )
+            .unwrap();
+            assert_eq!(curve_words(&compact), curve_words(&without));
+            assert_eq!((compact.peak_states, compact.transitions), (without.peak_states, without.transitions));
+            let mut cache = LuckDpCache::new(1 << 20);
+            cache.certified(&master, &skills, &notes, &[], params, &setup, &play, &delta, &deck, None, None).unwrap();
+            cache
+                .certified(
+                    &plain,
+                    &luck_skills(&plain).unwrap(),
+                    &notes,
+                    &[],
+                    params,
+                    &setup,
+                    &play,
+                    &delta,
+                    &deck,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(cache.stats().hits, 1);
+            let indicators = cache
+                .certified_with_moments(&master, &skills, &notes, &[], params, &setup, &play, &delta, &deck, None, None)
+                .unwrap();
+            assert!(!indicators.range_moments.is_empty());
+            assert_eq!(cache.len(), 2);
+            let mut native = LiveModel::new_gekisou(&master, &deck, &notes, &[], params, &setup).unwrap();
+            native.run_timed(&play, &delta).unwrap();
+            for (moments, range) in dp.range_moments.iter().zip(native.gekisou_ranges()) {
+                assert!(
+                    moments.luck_points.contains(f64::from(range.luck_points)),
+                    "result={result}, range={range:?}, moments={moments:?}"
+                );
+                assert!(moments.luck_points.upper() - moments.luck_points.lower() < 1e-8);
+                for (count, expected) in moments.lot_results.iter().zip(range.lot_results) {
+                    assert!(count.contains(f64::from(expected)));
+                    assert!(count.upper() - count.lower() < 1e-8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_consumed_lottery_has_exact_nominal_rewards_and_critical_points() {
+        let (mut master, _, mut params, mut setup, _, _) = fixture(0, 140);
+        master.gekisou_skill_effects.clear();
+        master.gekisou_luck_bonus_lots = (0..5)
+            .flat_map(|kind| {
+                (0..4).map(move |result| crate::master::LuckBonusLotRow {
+                    id: kind * 4 + result + 1,
+                    chance_lot_type: kind,
+                    lot_result: result,
+                    weight: 1,
+                })
+            })
+            .collect();
+        master.skill_conditions.push(
+            serde_json::from_value(json!({
+                "_id": 7003, "_conditionType": 7000, "_conditionValues": [3],
+                "_conditionTargetIDs": [], "_isPositive": true,
+            }))
+            .unwrap(),
+        );
+        master
+            .skill_condition_sets
+            .push(serde_json::from_value(json!({"_id": 7, "_group": 7003, "_conditionIds": [7003]})).unwrap());
+        master.gekisou_support_skills.push(crate::master::SkillRow {
+            id: 77,
+            gekisou_mission_type: 2,
+            ..Default::default()
+        });
+        master
+            .gekisou_support_skill_effects
+            .push(serde_json::from_value(row(77, "_gekisouSupportSkillID", 77, 11002, 7, 7003, 0, 0)).unwrap());
+        master.reindex().unwrap();
+        let notes = [LiveNote { note_id: 1, time_ms: 200, note_operate_type: 1, judgement_type: 1 }];
+        params.converted_note_count = 1;
+        setup.fevers = vec![(100, 400)];
+        let mut frames: Vec<_> = (0..=20).map(|i| PlayFrame { time_ms: i * 100, judged: Vec::new() }).collect();
+        frames[2].judged.push(JudgedNote { note_id: 1, judgement: 5, judgement_time_ms: 200 });
+        let delta = vec![0.1; frames.len()];
+        let play = LivePlay { frames, base_seed: 0 };
+        let deck = [Performer {
+            gekisou_skill: Some((2, 1)),
+            gekisou_mission_type: 2,
+            gekisou_support_skills: vec![(77, 1)],
+            ..Default::default()
+        }];
+        let skills = luck_skills(&master).unwrap();
+        let dp = luck_rush_dp_certified_with_moments(
+            &master,
+            &skills,
+            &notes,
+            &[],
+            params,
+            &setup,
+            &play,
+            &delta,
+            &deck,
+            None,
+            None,
+        )
+        .unwrap();
+        let range = &dp.range_moments[0];
+        for count in range.lot_results {
+            assert!(count.contains(0.25), "{range:?}");
+            assert!(count.upper() - count.lower() < 1e-10);
+        }
+        // One equally weighted outcome awards (0 + 5 + 10 + 10)/4, plus a seven-point
+        // one-shot bonus in the next frame on the Critical branch only.
+        assert!(range.luck_points.contains(8.0), "{range:?}");
+        assert!(range.luck_points.upper() - range.luck_points.lower() < 1e-10);
     }
 
     #[test]
@@ -2298,7 +2764,7 @@ mod tests {
         let (master, notes, params, setup, _, _) = fixture(3, 60);
         let model = LiveModel::new_gekisou(&master, &[], &notes, &[], params, &setup).unwrap();
         let machine = &model.gk.as_ref().unwrap().ctrl.machine;
-        let mut dp = Dp::<f64>::new(vec![LuckScore::default(); 3], machine);
+        let mut dp = Dp::<f64>::new(vec![LuckScore::default(); 3], machine, false);
         let mut dist = Distribution::default();
         dist.insert(State { rush: true, query_rush: true, score: true, score_before: false, ..State::default() }, 1.0);
         dp.dist = dist;

@@ -1,63 +1,29 @@
-//! Chart statistics: what a chart contributes to the live score whatever the deck, measured on the whole-live
-//! simulation ([`crate::live::full`]) in two scenarios: with Gekisou on (`seeds`), using the solo Gekisou
-//! updater's score-query schedule, and with Gekisou off (`off_seeds`). These are scoring models, not complete
-//! Free Live, Challenge Live or network Battle Live lifecycle emulations.
+//! Chart score expectations and single-skill aptitude on the whole-live simulation.
 //!
-//! With Gekisou on, the play is the theoretical best play of a live with Gekisou
-//! ([`JudgementStream::theoretical_best_gekisou`]): every judged note at its exact time, Just inside the Just-count
-//! ranges (where the game enables the Just judgement) and Perfect elsewhere, the frame delta times of the default
-//! schedule. The Gekisou ranges are the chart's fevers with the song's missions ([`Scenario::Free`]); the player takes
-//! rank 1 in every range, so every completed range adds its rank 1 bonus. Luck ranges draw lottery results (and luck
-//! rushes, which raise the note score) from the play's random seed, so everything is given per seed of a seed set: one
-//! seed when no range is a luck range (the play then draws nothing), else the first [`published_seeds`]. The seed set
-//! is not the game's seed law (unknown), so a mean over it is not a native expectation.
+//! Gekisou measurements use the theoretical best play: exact note times, Just in Just-count ranges and
+//! Perfect elsewhere, with solo rank-1 score snapshots. Independent nominal lottery and skill probabilities
+//! define the expectation. Each estimate is its center and outward interval half-width. Replay seeds are
+//! separate from these measurements. The Perfect play supplies the other endpoint of Just-rate interpolation.
 //!
-//! Other ranks are counterfactual fixed-rank estimates on the same solo score-query path
-//! ([`full::LiveModel::new_gekisou_ranked`]). Opponents are not simulated. Native network ranking instead reads
-//! the controller's frame snapshots, so these estimates are not a native multiplayer frame replay.
-//! A range's rank bonus is `trunc(rangeScore * percent / 100)`, queued at completion with the range's end
-//! timestamp and consumed by a later score update; it changes no factor and no note score, and a range's score (its end
-//! score minus its start score) holds an earlier range's bonus at both ends, so it does not depend on the ranks. At
-//! ranks `r_i` the no-skill score is then exact ([`SeedStats::score_at_ranks`]) and every weight moves by the range
-//! weights ([`SeedStats::weights_at_ranks`]). The ranks reach the skills only through the confirmed-rank condition
-//! 7012: a kind whose condition groups have it gets no range weights, and a chart where a range's bonus falls inside
-//! another range's score frames gets none at all.
+//! Ordinary score-up kinds retain their native conditions, lifetimes, factors and score frames. Their weights
+//! are expected increments per unit of power and effect factor. Range weights describe fixed-rank sensitivity
+//! on the solo timestamp-query schedule. A kind reading confirmed rank has no linear range weights.
 //!
-//! Each seed also plays the no-skill live on the Perfect play: the same play with every Just judged Perfect instead
-//! (Just is enabled only inside the Just-count ranges, so nothing else changes), for a Just rate between the two.
-//!
-//! With Gekisou off, the play is the theoretical best play of a live without Gekisou
-//! ([`JudgementStream::theoretical_best`]): every judged note Perfect at its exact time, seed [`OFF_SEED`]; there is
-//! no Just, luck, Gekisou combo or rank bonus, and a chart with more than three fevers plays as any other. A kind
-//! whose conditions read the Gekisou state cannot play there and has no weights.
-//!
-//! Numbers, per seed, at the measurement power [`POWER`]:
-//! - `score`: the exact no-skill score, rank bonuses included;
-//! - per score-up kind ([`Kind`]: a live skill effect row of type 2000, 2002, 2004 or 2005 with its duration,
-//!   targets and conditions, value aside) and performance position `k`: `weights[kind][k]`, the exact score gained
-//!   by a deck whose position-`k` member has one such effect at a factor of 1 (value 10000), divided by
-//!   [`POWER`]. The skill runs through the simulation's own updaters, conditions, frames and appliers, so the
-//!   weight carries the modeled rules: its execute and finish frames, the 40 ms score frames, the combo and
-//!   Gekisou combo factors, Just scores, luck rushes and the rank bonuses of the ranges it overlaps;
-//! - with Gekisou on, per range `i` also `range_weights[kind][k][i]`: the range score that effect gains, divided by
-//!   [`POWER`].
-//!
-//! A deck of these kinds scores, up to the floors, `P * (score / power + sum_k factor_k * weights[kind_k][k])` with
-//! `factor` the effect's factor as the applier converts it ([`kind_factor`]). [`SeedStats::check`] plays a random
-//! deck of real master values at another power and bounds the deviation, [`SeedStats::rank_check`] the same deck at
-//! random ranks and [`OffSeedStats::check`] a random deck with Gekisou off; a chart whose deviation exceeds a bound
-//! fails. Effects of other types (cumulative score 2001 / 2003, life, judgement conversion, Gekisou skills, snap
-//! skills) are not linear in the chart alone: a deck's score comes from the simulation itself.
+//! Full nominal expectations of random score-only decks validate the linear predictions within the flooring
+//! bound, including explicit counterfactual rank placements. Gekisou skill aptitude measures one shape at a
+//! time and includes its interaction with the plain score-up kind. Free Live uses its own deterministic run.
 
 use serde::Serialize;
 
 mod aptitude;
+mod expectation;
 mod luck;
 
 pub use aptitude::{
-    AptitudeHeader, AptitudeOptions, ChartAptitude, Condition, Cumulative, Effect, RangeDelta, RangeFactors, SeedRule,
-    Shape, ShapeSkill, Variant, VariantCheck, aptitude_header, shapes,
+    AptitudeHeader, ChartAptitude, Condition, Cumulative, Effect, RangeDelta, RangeFactors, Shape, ShapeSkill, Variant,
+    aptitude_header, shapes,
 };
+pub use expectation::{Estimate, ExpectationCheck, ExpectedRange, ExpectedStats};
 pub use luck::{
     LUCK_RUNS, LuckEntry, LuckOptions, LuckSteps, LuckTable, luck_compose, luck_neutral, luck_table_dp,
     luck_table_dp_certified, luck_table_steps,
@@ -78,13 +44,13 @@ use crate::num::ceil_to_i32;
 use crate::scenario::Scenario;
 
 /// Output format name.
-pub const FORMAT: &str = "ournotes-deck.chart-stats/2";
+pub const FORMAT: &str = "ournotes-deck.chart-stats/3";
 /// Deck power of the measurements (a power range of real decks).
 pub const POWER: i32 = 300_000;
 /// Deck power of the check deck.
 pub const CHECK_POWER: i32 = 1_000_003;
-/// Default number of seeds when a chart has a luck range.
-pub const GEKISOU_SEEDS: usize = 8;
+/// Default number of replay seeds when a chart has a luck range.
+pub const REPLAY_SEEDS: usize = 8;
 /// The effect value of factor 1 (`value / 10000`).
 pub const UNIT_VALUE: i64 = 10000;
 /// The most fevers a live can play: the game keeps three Gekisou ranges and fails when a fourth fever starts (the
@@ -290,23 +256,6 @@ impl RangeInfo {
     }
 }
 
-/// A range on one seed's no-skill play.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RangeResult {
-    /// Score gained inside the range (the score at its end minus the score at its start).
-    pub range_score: i32,
-    pub rank_bonus: i32,
-    pub max_combo: i32,
-    pub just_count: i32,
-    /// Luck points gained (`TotalBonusPoint`, the luck mission's rank figure).
-    pub luck_points: i32,
-    /// Lottery results drawn: Miss, Hit, Super Hit, Critical.
-    pub lot_results: [i32; 4],
-    /// The range score on the Perfect play (every Just judged Perfect).
-    pub range_score_perfect: i32,
-}
-
 /// The check deck of a seed: a random deck of real master values at [`CHECK_POWER`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -316,90 +265,6 @@ pub struct Check {
     pub exact: i32,
     pub predicted: f64,
     pub bound: f64,
-}
-
-/// The check deck of a seed played at random ranks.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RankCheck {
-    /// The rank of each range (1..=5).
-    pub ranks: Vec<i32>,
-    pub exact: i32,
-    pub predicted: f64,
-    pub bound: f64,
-}
-
-/// One seed's measurements at [`POWER`], Gekisou on.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SeedStats {
-    pub seed: i32,
-    /// The exact no-skill score, rank bonuses included.
-    pub score: i32,
-    pub ranges: Vec<RangeResult>,
-    /// `weights[kind][position]`: score gained per unit of deck power and of the effect's factor.
-    pub weights: Vec<Vec<f64>>,
-    pub check: Check,
-    /// The exact no-skill score on the Perfect play (every Just judged Perfect), its rank 1 bonuses included.
-    pub score_perfect: i32,
-    /// `range_weights[kind][position][range]`: range score gained per unit of deck power and of the effect's
-    /// factor. `None` when a range's bonus can fall inside another range's score, a kind's `None` when its
-    /// conditions read the confirmed rank: the ranks do not follow linearly there.
-    pub range_weights: Option<Vec<Option<Vec<Vec<f64>>>>>,
-    /// The check deck at random ranks; `None` without ranges, without range weights or when the check deck has a
-    /// kind without them.
-    pub rank_check: Option<RankCheck>,
-}
-
-impl SeedStats {
-    fn check_ranks(&self, ranges: &[RangeInfo], ranks: &[i32]) -> Result<(), Error> {
-        if ranks.len() != ranges.len() || ranges.len() != self.ranges.len() {
-            return Err(Error::Input(format!("{} ranks for {} ranges", ranks.len(), self.ranges.len())));
-        }
-        Ok(())
-    }
-
-    /// The exact no-skill score at [`POWER`] when range `i` takes rank `ranks[i]` (1..=5):
-    /// `score - sum_i rankBonus_i + sum_i trunc(rangeScore_i * percent_i(ranks[i]) / 100)`. It holds when
-    /// `range_weights` is not `None`.
-    pub fn score_at_ranks(&self, ranges: &[RangeInfo], ranks: &[i32]) -> Result<i32, Error> {
-        self.check_ranks(ranges, ranks)?;
-        let mut score = self.score as i64;
-        for ((r, info), &rank) in self.ranges.iter().zip(ranges).zip(ranks) {
-            score += r.range_score as i64 * info.percent(rank)? / 100 - r.rank_bonus as i64;
-        }
-        Ok(score as i32)
-    }
-
-    /// `weights[kind][position]` when range `i` takes rank `ranks[i]` (1..=5): `weights[kind][k] + sum_i
-    /// (percent_i(ranks[i]) - percent_i(1)) / 100 * range_weights[kind][k][i]`; `None` without range weights, a
-    /// kind's `None` without its own.
-    pub fn weights_at_ranks(
-        &self,
-        ranges: &[RangeInfo],
-        ranks: &[i32],
-    ) -> Result<Option<Vec<Option<Vec<f64>>>>, Error> {
-        self.check_ranks(ranges, ranks)?;
-        let Some(rw) = &self.range_weights else { return Ok(None) };
-        let mut d = Vec::with_capacity(ranges.len());
-        for (info, &rank) in ranges.iter().zip(ranks) {
-            d.push((info.percent(rank)? - info.percent(1)?) as f64 / 100.0);
-        }
-        Ok(Some(
-            self.weights
-                .iter()
-                .zip(rw)
-                .map(|(w, rw)| {
-                    rw.as_ref().map(|rw| {
-                        w.iter()
-                            .zip(rw)
-                            .map(|(&w, r)| w + r.iter().zip(&d).map(|(&r, &d)| d * r).sum::<f64>())
-                            .collect()
-                    })
-                })
-                .collect(),
-        ))
-    }
 }
 
 /// The measurements at [`POWER`] of a seed with Gekisou off.
@@ -441,9 +306,10 @@ pub struct ChartStats {
     pub ranges: Vec<RangeInfo>,
     /// Notes judged Just on the play.
     pub just_notes: i32,
-    /// Measurements per seed with Gekisou on; empty when the game cannot play the chart with Gekisou
-    /// ([`ChartStats::unplayable`]).
-    pub seeds: Vec<SeedStats>,
+    /// Gekisou expectations under independent nominal lottery and skill probabilities.
+    pub expectation: Option<ExpectedStats>,
+    /// Seeds available for whole-live replay.
+    pub replay_seeds: Vec<i32>,
     /// Measurements with Gekisou off, one seed ([`OFF_SEED`]); every chart has them.
     pub off_seeds: Vec<OffSeedStats>,
     /// Why the game cannot play the chart with Gekisou (Gekisou off plays it).
@@ -458,19 +324,16 @@ pub struct ChartStats {
 /// What the chart statistics measure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
-    /// The size of the seed set of a chart with a luck range.
-    pub seeds: usize,
-    /// The aptitude for Gekisou skills; `None`: left out.
-    pub aptitude: Option<AptitudeOptions>,
+    /// The number of replay seeds of a chart with a luck range.
+    pub replay_seeds: usize,
+    /// Include the aptitude for Gekisou skills.
+    pub aptitude: bool,
 }
 
 impl Options {
     fn validate(&self) -> Result<(), Error> {
-        if self.seeds == 0 {
+        if self.replay_seeds == 0 {
             return Err(Error::Input("an empty seed set".into()));
-        }
-        if self.aptitude.is_some_and(|a| a.max_seeds < 2 || a.cross_seeds == 0) {
-            return Err(Error::Input("aptitude needs at least two maximum seeds and one cross seed".into()));
         }
         Ok(())
     }
@@ -478,7 +341,7 @@ impl Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { seeds: GEKISOU_SEEDS, aptitude: Some(AptitudeOptions::default()) }
+        Options { replay_seeds: REPLAY_SEEDS, aptitude: true }
     }
 }
 
@@ -729,91 +592,6 @@ impl Live<'_> {
         Ok(Checked { exact, predicted, bound })
     }
 
-    /// The measurements of one seed with Gekisou on; `infos` are the chart's ranges, `linear` whether the ranks
-    /// follow linearly on the chart, `reads_rank[kind]` whether a kind reads the confirmed rank.
-    #[allow(clippy::too_many_arguments)]
-    fn seed_stats(
-        &self,
-        kinds: &[Kind],
-        infos: &[RangeInfo],
-        linear: bool,
-        reads_rank: &[bool],
-        seed: i32,
-        rng: &mut Rng,
-        rank_rng: &mut Rng,
-        judged: i32,
-    ) -> Result<SeedStats, Error> {
-        let none = vec![None; self.positions];
-        let (score, gk) = self.run(self.master, &none, POWER, seed, None)?;
-        let perfect = &self.gekisou.as_ref().ok_or_else(|| Error::Input("seed stats without Gekisou".into()))?.perfect;
-        let (score_perfect, gk_perfect) = self.run_play(perfect, self.master, &none, POWER, seed, None)?;
-        if gk_perfect.len() != gk.len() {
-            return Err(Error::Game("the Perfect play has other ranges".into()));
-        }
-        let ranges: Vec<RangeResult> = gk
-            .iter()
-            .zip(&gk_perfect)
-            .map(|(r, p)| RangeResult {
-                range_score: r.end_score.wrapping_sub(r.start_score),
-                rank_bonus: r.rank_bonus.unwrap_or(0),
-                max_combo: r.max_combo,
-                just_count: r.just_count,
-                luck_points: r.luck_points,
-                lot_results: r.lot_results,
-                range_score_perfect: p.end_score.wrapping_sub(p.start_score),
-            })
-            .collect();
-        let mut weights = vec![vec![0f64; self.positions]; kinds.len()];
-        let mut range_weights = vec![vec![vec![0f64; ranges.len()]; self.positions]; kinds.len()];
-        for (ki, kind) in kinds.iter().enumerate() {
-            let unit = kind_factor(kind.effect_type, UNIT_VALUE);
-            for k in 0..self.positions {
-                let mut skills = none.clone();
-                skills[k] = Some(KIND_SKILL_BASE - ki as i64);
-                let (s, gk) = self.run(self.measure, &skills, POWER, seed, None)?;
-                weights[ki][k] = (s as f64 - score as f64) / (POWER as f64 * unit);
-                for ((w, r), r0) in range_weights[ki][k].iter_mut().zip(&gk).zip(&ranges) {
-                    let rs = r.end_score.wrapping_sub(r.start_score);
-                    *w = (rs as f64 - r0.range_score as f64) / (POWER as f64 * unit);
-                }
-            }
-        }
-        let range_weights: Option<Vec<Option<Vec<Vec<f64>>>>> =
-            linear.then(|| range_weights.into_iter().zip(reads_rank).map(|(w, &r)| (!r).then_some(w)).collect());
-
-        // the check deck: a random kind and master value at each position, at another power
-        let usable: Vec<usize> = (0..kinds.len()).collect();
-        let (deck, rows) = check_deck(kinds, &usable, self.positions, rng);
-        let master = Self::master_with(self.master, &rows);
-        let floors = judged as f64 + MAX_GEKISOU_FEVERS as f64;
-        let c = self
-            .check(kinds, &master, &deck, seed, None, score as f64 / POWER as f64, |ki, k| weights[ki][k], floors, 0.0)?
-            .within(|| format!("seed {seed}"))?;
-        let check = Check { deck, exact: c.exact, predicted: c.predicted, bound: c.bound };
-        let mut stats =
-            SeedStats { seed, score, ranges, weights, check, score_perfect, range_weights, rank_check: None };
-
-        // the same deck at random ranks, through the explicit rank confirmations
-        let Some(rw) = &stats.range_weights else { return Ok(stats) };
-        if stats.ranges.is_empty() || stats.check.deck.iter().flatten().any(|&(ki, _)| rw[ki].is_none()) {
-            return Ok(stats);
-        }
-        let ranks: Vec<i32> = infos.iter().map(|_| 1 + rank_rng.below(RANKS) as i32).collect();
-        let confirmations: Vec<(i32, i64)> =
-            ranks.iter().zip(infos).map(|(&r, info)| Ok((r, info.percent(r)?))).collect::<Result<_, Error>>()?;
-        let base = stats.score_at_ranks(infos, &ranks)? as f64 / POWER as f64;
-        let w = stats.weights_at_ranks(infos, &ranks)?.ok_or_else(|| Error::Game("no range weights".into()))?;
-        // each range moves a weight by the difference of two floored bonuses from its rank 1 value: under 2 points
-        let slack = 2.0 * infos.len() as f64;
-        let deck = stats.check.deck.clone();
-        let weight = |ki: usize, k: usize| w[ki].as_ref().map_or(f64::NAN, |w| w[k]);
-        let c = self
-            .check(kinds, &master, &deck, seed, Some(&confirmations), base, weight, floors, slack)?
-            .within(|| format!("seed {seed} at ranks {ranks:?}"))?;
-        stats.rank_check = Some(RankCheck { ranks, exact: c.exact, predicted: c.predicted, bound: c.bound });
-        Ok(stats)
-    }
-
     /// The measurements of one seed with Gekisou off.
     fn off_seed_stats(&self, kinds: &[Kind], seed: i32, rng: &mut Rng, judged: i32) -> Result<OffSeedStats, Error> {
         let none = vec![None; self.positions];
@@ -853,10 +631,14 @@ impl Live<'_> {
     }
 }
 
-/// The statistics of one chart for these kinds; `seeds` is the size of the seed set when a range is a luck range; the
-/// aptitude for Gekisou skills with the default [`AptitudeOptions`].
-pub fn chart_stats(master: &Master, chart: &DataChart, kinds: &[Kind], seeds: usize) -> Result<ChartStats, Error> {
-    chart_stats_with(master, chart, kinds, &Options { seeds, ..Options::default() })
+/// The expectations of one chart for these kinds, with this number of replay seeds.
+pub fn chart_stats(
+    master: &Master,
+    chart: &DataChart,
+    kinds: &[Kind],
+    replay_seeds: usize,
+) -> Result<ChartStats, Error> {
+    chart_stats_with(master, chart, kinds, &Options { replay_seeds, ..Options::default() })
 }
 
 /// The statistics of one chart for these kinds with these options.
@@ -867,7 +649,6 @@ pub fn chart_stats_with(
     options: &Options,
 ) -> Result<ChartStats, Error> {
     options.validate()?;
-    let seeds = options.seeds;
     let settings = LiveScoreSettings::from_master(master)?;
     let c: Chart = chart.chart(&settings)?;
     let row = master
@@ -925,7 +706,8 @@ pub fn chart_stats_with(
         missions: resolved.gekisou_missions,
         ranges,
         just_notes: 0,
-        seeds: Vec::new(),
+        expectation: None,
+        replay_seeds: Vec::new(),
         off_seeds: Vec::new(),
         unplayable: None,
         gekisou_aptitude: None,
@@ -993,31 +775,42 @@ pub fn chart_stats_with(
     };
     let setup = &live.gekisou.as_ref().expect("Gekisou on").setup;
     let luck = setup.missions.iter().take(setup.fevers.len()).any(|&m| m == MISSION_LUCK);
-    let seed_list = if luck { published_seeds(seeds.max(1)) } else { vec![0] };
+    out.replay_seeds = if luck { published_seeds(options.replay_seeds) } else { vec![0] };
     let linear = !bonus_inside_a_range(&chart.fevers);
     let reads_rank: Vec<bool> = kinds.iter().map(|k| k.reads_rank(master)).collect();
     let mut rng = Rng(CHECK_SALT ^ chart.score_id as u64);
     let mut rank_rng = Rng(RANK_CHECK_SALT ^ chart.score_id as u64);
-    for seed in seed_list {
-        let s = live.seed_stats(kinds, &out.ranges, linear, &reads_rank, seed, &mut rng, &mut rank_rng, judged)?;
-        out.seeds.push(s);
-    }
+    out.expectation = Some(expectation::chart_expectation(
+        &live,
+        kinds,
+        &out.ranges,
+        linear,
+        &reads_rank,
+        &mut rng,
+        &mut rank_rng,
+        judged,
+    )?);
 
     // the aptitude for Gekisou skills
-    if let Some(a) = &options.aptitude {
+    if options.aptitude {
         let shapes = shapes(master);
         if !shapes.is_empty() && !out.ranges.is_empty() {
-            let inputs = aptitude::Inputs { seeds: &out.seeds, linear, score_id: chart.score_id, judged, options: a };
+            let inputs = aptitude::Inputs {
+                base: out.expectation.as_ref().expect("Gekisou expectation"),
+                linear,
+                score_id: chart.score_id,
+                judged,
+            };
             out.gekisou_aptitude = Some(aptitude::chart_aptitude(&live, kinds, &out.ranges, &shapes, &inputs)?);
         }
     }
     Ok(out)
 }
 
-/// The statistics of every chart of a deck data file (score id order) as the `ournotes-deck.chart-stats/2` document;
-/// `seeds` is the size of the seed set of charts with a luck range (default [`GEKISOU_SEEDS`]).
-pub fn document(data: &DeckData, seeds: Option<usize>) -> Result<serde_json::Value, Error> {
-    document_with(data, &Options { seeds: seeds.unwrap_or(GEKISOU_SEEDS), ..Options::default() })
+/// Every chart of a deck data file, in score-id order, as `ournotes-deck.chart-stats/3`.
+/// `replay_seeds` defaults to [`REPLAY_SEEDS`].
+pub fn document(data: &DeckData, replay_seeds: Option<usize>) -> Result<serde_json::Value, Error> {
+    document_with(data, &Options { replay_seeds: replay_seeds.unwrap_or(REPLAY_SEEDS), ..Options::default() })
 }
 
 /// [`document`] with these options.
@@ -1045,13 +838,14 @@ pub fn document_with(data: &DeckData, options: &Options) -> Result<serde_json::V
         "model": {
             "engine": "whole-live simulation (live::full), Gekisou on, solo rank 1",
             "play": "theoretical best: exact note times, Just inside Just-count ranges, Perfect elsewhere",
-            "score": "P * (score / power + sum_k factor_k * weights[kind_k][k]) up to the floors; checked per seed",
+            "score": "P * (score / power + sum_k factor_k * weights[kind_k][k]) within the flooring bound; checked against a full expectation",
             "power": POWER,
             "checkPower": CHECK_POWER,
             "unitValue": UNIT_VALUE,
-            "seeds": "one seed without a luck range, else the first published seeds; not a native expectation",
+            "expectation": "independent nominal lottery and skill probabilities; estimates as [center, outward interval half-width]",
+            "replaySeeds": "one replay seed without a luck range, else the requested published seeds",
             "ranks": "Gekisou on at rank r_i (1..5) in range i: score becomes score - sum_i rankBonus_i + sum_i \
-                      trunc(rangeScore_i * rankBonusPercents_i[r_i - 1] / 100) (exact) and weights[kind][k] becomes \
+                      rangeScore_i * rankBonusPercents_i[r_i - 1] / 100 within one flooring point per range, and weights[kind][k] becomes \
                       weights[kind][k] + sum_i (rankBonusPercents_i[r_i - 1] - rankBonusPercents_i[0]) / 100 * \
                       rangeWeights[kind][k][i]; rankCheck plays the check deck at random ranks",
             "perfect": "scorePerfect and rangeScorePerfect: the no-skill score (rank 1 bonuses included) and range \
@@ -1061,7 +855,7 @@ pub fn document_with(data: &DeckData, options: &Options) -> Result<serde_json::V
                     kind whose conditions read the Gekisou state has null weights; checked",
             "gekisouAptitude": aptitude::MODEL,
         },
-        "gekisouAptitude": options.aptitude.as_ref().map(|a| aptitude_header(&data.master, &kinds, a)),
+        "gekisouAptitude": options.aptitude.then(|| aptitude_header(&data.master, &kinds)),
         "kinds": kinds,
         "charts": charts,
     }))

@@ -1270,6 +1270,7 @@ mod luck_certified_tests {
         LuckDpCertifiedResult {
             steps: vec![(123, [tenth, tenth, tenth, ProbabilityMass::from_ratio(7, 10).unwrap()])],
             probes: vec![true],
+            range_moments: Vec::new(),
             peak_states: 17,
             transitions: 31,
         }

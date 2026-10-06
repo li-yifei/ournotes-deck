@@ -1,98 +1,32 @@
-//! The aptitude of a chart for Gekisou skills: what each Gekisou skill shape adds to the chart's score alone, measured
-//! on the whole-live simulation.
+//! Single-shape Gekisou aptitude under independent nominal lottery and skill probabilities.
 //!
-//! A shape is a member card's Gekisou skill at its highest level, or a snap's Gekisou support skill at the level of
-//! the snap's highest rank, with its score-relevant effect parameters; skills with the same parameters are one shape
-//! ([`shapes`]). A support skill's member target condition (5000, on its own member: the band condition) is measured
-//! both ways, the member a target (`bandMatch` true) or not (false), so support skills that differ only in the band
-//! are one shape.
-//!
-//! Each shape of the chart's missions is played alone on the chart's no-skill play (Gekisou on, rank 1, the
-//! theoretical best play; [`super::SeedStats`]) and on its Perfect play: a member skill on one performer; a support
-//! skill on one performer whose Gekisou skill is a synthetic one without effects (a support skill acts only with a
-//! member Gekisou skill), of the support skill's mission. A Gekisou (support) skill acts only while a range of its
-//! mission is concerned, so a shape of another mission adds nothing and is not measured. The increments (`with -
-//! without` on the same seed) are exact per seed. A shape is marked deterministic only after excluding random
-//! dependencies (luck ranges, luck effects 11000..=11005 and probability conditions 4011) and checking agreement on
-//! [`DETERMINISTIC_TEST`] seeds. It is then given on one seed; other shapes use seed batches
-//! ([`BATCHES`]) until the standard error of its score increment is at most the larger of [`RELATIVE`] of the
-//! increment and [`BASELINE`] of the corresponding no-skill score for BOTH the best and Perfect plays. The cross term, the change of the plain kind's weights, uses
-//! the first `cross_seeds` of them.
-//!
-//! The increments of several shapes do not add up: the Gekisou combo factor saturates, the luck rush support skills
-//! and the luck gauge skills interact. Judgement conversion can also change the input to other skills.
+//! A member skill acts alone on one performer. A support skill is paired with an effect-free member skill
+//! of its mission. Member-target conditions are measured both ways. The expected increments compare these
+//! formations with the chart's no-skill expectation; ordinary plain score-up weights supply the cross terms.
 
 use serde::Serialize;
 
+use super::expectation::{Evaluator, delta, estimate, interval, real, scaled};
 use super::{
-    Checked, KIND_SKILL_BASE, Kind, Live, MAX_GEKISOU_FEVERS, POWER, RangeInfo, Rng, SeedStats, UNIT_VALUE, check_deck,
-    kind_factor,
+    Estimate, ExpectationCheck, ExpectedStats, KIND_SKILL_BASE, Kind, Live, MAX_GEKISOU_FEVERS, POWER, RangeInfo, Rng,
+    UNIT_VALUE, check_deck, kind_factor,
 };
-use crate::error::Error;
-use crate::live::full::{GekisouRange, LiveModel, Performer};
 use crate::live::score::get_frame;
-use crate::live::seeds::published_seeds;
-use crate::master::{GekisouSkillEffectRow, Master, SkillRow};
+use crate::{
+    Error,
+    live::{
+        certified::F64Interval,
+        full::{LiveModel, Performer},
+    },
+    master::{GekisouSkillEffectRow, Master, SkillRow},
+};
 
-/// Seeds a shape's increments must agree on to be deterministic (the first published seeds).
-pub const DETERMINISTIC_TEST: usize = 4;
-/// Seed batches of a shape that is not deterministic: the first seeds of the published set.
-pub const BATCHES: [usize; 12] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
-/// The standard error target relative to the score increment.
-pub const RELATIVE: f64 = 0.01;
-/// The standard error target relative to the no-skill score.
-pub const BASELINE: f64 = 0.001;
-/// Default most seeds of a shape.
-pub const MAX_SEEDS: usize = 65536;
-/// Default most seeds of the cross term.
-pub const CROSS_SEEDS: usize = 64;
-/// Skill condition type of a member target: a skill's condition on its own member (the band condition).
 const CONDITION_MEMBER_TARGET: i64 = 5000;
-/// Gekisou skill id of the synthetic host of mission `m`: `HOST_SKILL_BASE - m`.
 const HOST_SKILL_BASE: i64 = -1000;
-/// Start states of the generators of the check decks and ranks, each xored with the score id and the variant.
 const APT_CHECK_SALT: u64 = 0x6170_745f_6368_6563;
 const APT_RANK_SALT: u64 = 0x6170_745f_7261_6e6b;
-/// How the shapes are measured, for the document.
-pub const HOST: &str = "each shape alone on one performer, the other positions empty: a member skill as the \
-    performer's Gekisou skill; a support skill paired with a synthetic Gekisou skill without effects (id -1000 - \
-    mission, the support skill's mission) on the same performer, in every chart; a band condition (5000) measured \
-    with the performer a target of it (the band, character, card type or tag of its first target) and with none \
-    of those (bandMatch false)";
-/// The model, for the document.
-pub const MODEL: &str = "charts[].gekisouAptitude: every Gekisou skill shape of the chart's missions (gekisouAptitude.\
-    shapes) played alone on the whole-live simulation, Gekisou on, rank 1, the theoretical best play (score) and \
-    its Perfect play (scorePerfect); increments with minus without on the same seed as [mean, standard error]; a \
-    shape of another mission adds nothing (its skills trigger only while a range of their mission is concerned); \
-    deterministic shapes on one seed, the others on seed batches until the standard error is at most max(1% of the \
-    increment, 0.1% of the corresponding no-skill score) for both score and scorePerfect; tail = score - sum_j (rangeScore_j + rankBonus_j); at ranks r_j the \
-    increment is tail + sum_j rangeScore_j * (1 + p_j(r_j) / 100) up to one point per range; weights and \
-    rangeWeights: the change of the plain kind's weights (cross term) on the first crossSeeds seeds; one check per \
-    variant at random ranks and a random plain deck at checkPower, failing beyond the flooring bound; increments \
-    of several shapes do not add up (combo saturation, luck rush/gauge interactions and Just-count conditions). \
-    Baseline seeds and offSeeds are unchanged: no best formation is selected. Only battleLiveScore is affected, \
-    never soloScore or Free Live. The seed mean is not the game's expectation; standard error describes sampling \
-    variation, not model accuracy. Interpolating the no-live-skill increment between Just and Perfect plays is \
-    approximate (13005 conversion, per-Just 2001 and 13002 are nonlinear); Perfect-play cross weights are not \
-    measured, so full aptitude with nonzero live skills is unavailable below 100% Just. The Great-rate factor \
-    1 - 0.2q is approximate too. Combo protection \
-    12004, Great-to-Perfect 12006 and judgement-window 4004 have no effect on this best play; 13000, 13002 and \
-    11002 can change range indicators without changing score";
-
-/// Options of the aptitude.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AptitudeOptions {
-    /// Most seeds of a shape that is not deterministic.
-    pub max_seeds: usize,
-    /// Most seeds of the cross term.
-    pub cross_seeds: usize,
-}
-
-impl Default for AptitudeOptions {
-    fn default() -> AptitudeOptions {
-        AptitudeOptions { max_seeds: MAX_SEEDS, cross_seeds: CROSS_SEEDS }
-    }
-}
+pub const HOST: &str = "each shape alone on one performer, other positions empty; support skills paired with an effect-free member Gekisou skill of the same mission; member-target conditions measured both ways";
+pub const MODEL: &str = "every Gekisou skill shape of the chart's missions measured alone under independent nominal lottery and skill probabilities; expected increments with minus without as [center, outward interval half-width] on the best and Perfect plays; tail = score - sum(rangeScore + rankBonus); plain-kind weights and rangeWeights are expected cross terms; each variant checked against a full expectation of a random plain deck at fixed ranks and checkPower within the flooring bound; indicators use deterministic judgement counters and expected lottery points; partial Just rates interpolate the no-live-skill increments, while plain-skill cross weights use the best play";
 
 /// A skill condition of a shape's effect.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -162,25 +96,23 @@ pub struct Shape {
     pub skills: Vec<ShapeSkill>,
 }
 
-/// The seed rule of the aptitude, for the document.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SeedRule {
-    pub deterministic_test: usize,
-    pub batches: Vec<usize>,
-    pub relative: f64,
-    pub baseline: f64,
-    pub cross_seeds: usize,
-}
-
-/// The document header of the aptitude (`gekisouAptitude`).
+/// The aptitude measurement contract and shape catalog.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AptitudeHeader {
     pub plain_kind: Option<usize>,
     pub host: &'static str,
-    pub seed_rule: SeedRule,
+    pub law: &'static str,
     pub shapes: Vec<Shape>,
+}
+
+pub fn aptitude_header(master: &Master, kinds: &[Kind]) -> AptitudeHeader {
+    AptitudeHeader {
+        plain_kind: plain_kind(kinds),
+        host: HOST,
+        law: "independent nominal lottery and skill probabilities",
+        shapes: shapes(master),
+    }
 }
 
 /// The factors of a range that shape the increments, from the chart's no-skill play.
@@ -197,58 +129,53 @@ pub struct RangeFactors {
     pub tail_notes: i32,
     /// Notes judged before the Start frame (the combo entering the range).
     pub combo_at_start: i32,
-    /// Lotteries drawn without skills (the sum of the lottery results) over the chart's seeds, `[mean, se]`.
+    /// Expected number of lotteries drawn without skills.
+    #[serde(serialize_with = "super::expectation::serialize_counts")]
     pub lotteries: [f64; 2],
 }
 
-/// Increments of a range, each `[mean, se]`.
+/// Range increments, each [center, outward interval half-width].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RangeDelta {
+    #[serde(serialize_with = "super::expectation::serialize_points")]
     pub range_score: [f64; 2],
+    #[serde(serialize_with = "super::expectation::serialize_points")]
     pub rank_bonus: [f64; 2],
+    #[serde(serialize_with = "super::expectation::serialize_points")]
+    pub rank_bonus_perfect: [f64; 2],
+    #[serde(serialize_with = "super::expectation::serialize_points")]
     pub range_score_perfect: [f64; 2],
     pub max_combo: [f64; 2],
     pub just_count: [f64; 2],
+    #[serde(serialize_with = "super::expectation::serialize_points")]
     pub luck_points: [f64; 2],
 }
 
-/// The check of a variant: the shape with a random plain deck at random ranks at the check power.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VariantCheck {
-    pub seed: i32,
-    pub ranks: Vec<i32>,
-    pub deck: Vec<Option<(usize, i64)>>,
-    pub exact: i32,
-    pub predicted: f64,
-    pub bound: f64,
-}
-
-/// A shape (with a band condition result) on a chart: its increments, each `[mean, se]`.
+/// A shape's expected increments, each as [center, outward interval half-width].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Variant {
     pub shape: usize,
     pub band_match: Option<bool>,
-    pub deterministic: bool,
-    pub seeds: usize,
-    pub se_target_met: bool,
-    pub cross_seeds: usize,
-    pub score: [f64; 2],
-    pub score_perfect: [f64; 2],
-    pub tail: [f64; 2],
-    pub tail_perfect: [f64; 2],
-    pub converted: [f64; 2],
+    #[serde(serialize_with = "super::expectation::serialize_points")]
+    pub score: Estimate,
+    #[serde(serialize_with = "super::expectation::serialize_points")]
+    pub score_perfect: Estimate,
+    #[serde(serialize_with = "super::expectation::serialize_points")]
+    pub tail: Estimate,
+    #[serde(serialize_with = "super::expectation::serialize_points")]
+    pub tail_perfect: Estimate,
+    pub converted: Estimate,
     pub ranges: Vec<RangeDelta>,
-    /// The change of the plain kind's weight per position; `None` without a plain kind.
-    pub weights: Option<Vec<[f64; 2]>>,
-    /// The change of its range weights per position and range; `None` without range weights or a plain kind.
-    pub range_weights: Option<Vec<Vec<[f64; 2]>>>,
-    pub check: VariantCheck,
+    #[serde(serialize_with = "super::expectation::serialize_optional_weights")]
+    pub weights: Option<Vec<Estimate>>,
+    #[serde(serialize_with = "super::expectation::serialize_optional_matrix")]
+    pub range_weights: Option<Vec<Vec<Estimate>>>,
+    pub check: ExpectationCheck,
 }
 
-/// A chart's aptitude for Gekisou skills.
+/// A chart's aptitude for isolated Gekisou skill shapes.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartAptitude {
@@ -271,26 +198,6 @@ pub fn plain_kind(kinds: &[Kind]) -> Option<usize> {
                 && k.duration_ms == 5000
         })
         .map(|k| k.id)
-}
-
-/// The header of the aptitude.
-pub fn aptitude_header(master: &Master, kinds: &[Kind], options: &AptitudeOptions) -> AptitudeHeader {
-    let mut batches: Vec<usize> = BATCHES.iter().copied().filter(|&b| b <= options.max_seeds).collect();
-    if batches.last().is_none_or(|&b| b < options.max_seeds) {
-        batches.push(options.max_seeds);
-    }
-    AptitudeHeader {
-        plain_kind: plain_kind(kinds),
-        host: HOST,
-        seed_rule: SeedRule {
-            deterministic_test: DETERMINISTIC_TEST,
-            batches,
-            relative: RELATIVE,
-            baseline: BASELINE,
-            cross_seeds: options.cross_seeds,
-        },
-        shapes: shapes(master),
-    }
 }
 
 /// A condition group as its condition sets (by id), each a list of conditions.
@@ -499,196 +406,8 @@ fn performer(master: &Master, shape: &Shape, band: Option<bool>) -> Result<Perfo
     Ok(p)
 }
 
-/// The numbers of one live.
-#[derive(Clone, Debug)]
-struct Played {
-    score: i32,
-    ranges: Vec<GekisouRange>,
-    converted: u64,
-}
-
-/// A seed's no-skill numbers: the Just and the Perfect play, and the plain kind at each position.
-#[derive(Clone, Debug)]
-struct BaseRun {
-    just: Played,
-    perfect: Played,
-    /// `(score, range scores)` with the plain kind at position k.
-    cross: Option<Vec<(i32, Vec<i32>)>>,
-}
-
-/// A seed's increments.
-#[derive(Clone, Debug, PartialEq)]
-struct Sample {
-    seed: i32,
-    base_scores: [f64; 2],
-    values: Vec<f64>,
-    /// `(weights per position, range weights per position and range)` changes.
-    cross: Option<(Vec<f64>, Vec<Vec<f64>>)>,
-}
-
-/// The inputs of a chart's aptitude besides the live.
-pub(super) struct Inputs<'a> {
-    pub seeds: &'a [SeedStats],
-    pub linear: bool,
-    pub score_id: i64,
-    pub judged: i32,
-    pub options: &'a AptitudeOptions,
-}
-
-fn range_score(r: &GekisouRange) -> i32 {
-    r.end_score.wrapping_sub(r.start_score)
-}
-
-/// The measurement of a chart.
-struct Measure<'a, 'm> {
-    live: &'a Live<'m>,
-    master: Master,
-    measure: Master,
-    plain: Option<usize>,
-    unit: f64,
-    ranges: usize,
-    base: std::collections::HashMap<i32, BaseRun>,
-}
-
-impl Measure<'_, '_> {
-    fn play(
-        &self,
-        perfect: bool,
-        master: &Master,
-        p: Option<&Performer>,
-        skills: &[Option<i64>],
-        seed: i32,
-    ) -> Result<Played, Error> {
-        let g = self.live.gekisou.as_ref().ok_or_else(|| Error::Input("aptitude without Gekisou".into()))?;
-        let play = if perfect { &g.perfect } else { &self.live.play };
-        let formation: Vec<Performer> = p.into_iter().cloned().collect();
-        let (score, ranges, converted) = self.live.run_counted(play, master, &formation, skills, POWER, seed, None)?;
-        Ok(Played { score, ranges, converted })
-    }
-
-    /// The no-skill numbers of a seed, with the plain kind's runs when `cross`.
-    fn base(&mut self, seed: i32, cross: bool) -> Result<&BaseRun, Error> {
-        let none = vec![None; self.live.positions];
-        if !self.base.contains_key(&seed) {
-            let just = self.play(false, &self.master, None, &none, seed)?;
-            let perfect = self.play(true, &self.master, None, &none, seed)?;
-            self.base.insert(seed, BaseRun { just, perfect, cross: None });
-        }
-        if cross && self.plain.is_some() && self.base[&seed].cross.is_none() {
-            let c = self.cross_runs(None, seed)?;
-            self.base.get_mut(&seed).expect("base").cross = Some(c);
-        }
-        Ok(&self.base[&seed])
-    }
-
-    /// `(score, range scores)` with the plain kind at each position.
-    fn cross_runs(&self, p: Option<&Performer>, seed: i32) -> Result<Vec<(i32, Vec<i32>)>, Error> {
-        let Some(plain) = self.plain else { return Ok(Vec::new()) };
-        let mut out = Vec::with_capacity(self.live.positions);
-        for k in 0..self.live.positions {
-            let mut skills = vec![None; self.live.positions];
-            skills[k] = Some(KIND_SKILL_BASE - plain as i64);
-            let r = self.play(false, &self.measure, p, &skills, seed)?;
-            out.push((r.score, r.ranges.iter().map(range_score).collect()));
-        }
-        Ok(out)
-    }
-
-    /// A seed's increments of a performer: score, score on the Perfect play, tail, Perfect tail, conversions, then
-    /// per range the range score, rank bonus, Perfect range score, max combo, Just count and luck points.
-    fn sample(&mut self, p: &Performer, seed: i32, cross: bool) -> Result<Sample, Error> {
-        let none = vec![None; self.live.positions];
-        let just = self.play(false, &self.master, Some(p), &none, seed)?;
-        let perfect = self.play(true, &self.master, Some(p), &none, seed)?;
-        let c = if cross && self.plain.is_some() { Some(self.cross_runs(Some(p), seed)?) } else { None };
-        let ranges = self.ranges;
-        let unit = self.unit;
-        let b = self.base(seed, cross)?.clone();
-        if just.ranges.len() != ranges || perfect.ranges.len() != ranges {
-            return Err(Error::Game("the shape's plays have other ranges".into()));
-        }
-        let tail = |x: &Played, y: &Played| -> f64 {
-            let mut t = (x.score as i64 - y.score as i64) as f64;
-            for (a, b) in x.ranges.iter().zip(&y.ranges) {
-                t -= (range_score(a) as i64 - range_score(b) as i64) as f64;
-                t -= (a.rank_bonus.unwrap_or(0) as i64 - b.rank_bonus.unwrap_or(0) as i64) as f64;
-            }
-            t
-        };
-        let mut values = vec![
-            (just.score as i64 - b.just.score as i64) as f64,
-            (perfect.score as i64 - b.perfect.score as i64) as f64,
-            tail(&just, &b.just),
-            tail(&perfect, &b.perfect),
-            just.converted as f64 - b.just.converted as f64,
-        ];
-        for j in 0..ranges {
-            let (x, y) = (&just.ranges[j], &b.just.ranges[j]);
-            let (xp, yp) = (&perfect.ranges[j], &b.perfect.ranges[j]);
-            values.push((range_score(x) as i64 - range_score(y) as i64) as f64);
-            values.push((x.rank_bonus.unwrap_or(0) as i64 - y.rank_bonus.unwrap_or(0) as i64) as f64);
-            values.push((range_score(xp) as i64 - range_score(yp) as i64) as f64);
-            values.push((x.max_combo - y.max_combo) as f64);
-            values.push((x.just_count - y.just_count) as f64);
-            values.push((x.luck_points - y.luck_points) as f64);
-        }
-        let cross = match (c, &b.cross) {
-            (Some(c), Some(bc)) => {
-                let mut w = Vec::with_capacity(c.len());
-                let mut rw = Vec::with_capacity(c.len());
-                for ((s, rs), (s0, rs0)) in c.iter().zip(bc) {
-                    let with = (*s as f64 - just.score as f64) / (POWER as f64 * unit);
-                    let without = (*s0 as f64 - b.just.score as f64) / (POWER as f64 * unit);
-                    w.push(with - without);
-                    let per_range = (0..ranges)
-                        .map(|j| {
-                            let with = (rs[j] as f64 - range_score(&just.ranges[j]) as f64) / (POWER as f64 * unit);
-                            let without =
-                                (rs0[j] as f64 - range_score(&b.just.ranges[j]) as f64) / (POWER as f64 * unit);
-                            with - without
-                        })
-                        .collect();
-                    rw.push(per_range);
-                }
-                Some((w, rw))
-            }
-            _ => None,
-        };
-        Ok(Sample { seed, base_scores: [b.just.score as f64, b.perfect.score as f64], values, cross })
-    }
-}
-
-/// `[mean, standard error]` of values.
-fn mean_se(x: impl Iterator<Item = f64> + Clone) -> [f64; 2] {
-    let n = x.clone().count();
-    if n == 0 {
-        return [0.0, 0.0];
-    }
-    let mean = x.clone().sum::<f64>() / n as f64;
-    if n == 1 {
-        return [mean, 0.0];
-    }
-    let var = x.map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1) as f64;
-    [mean, (var / n as f64).sqrt()]
-}
-
-/// Both exported score plays must converge against their own paired no-skill baseline.
-fn score_targets_met(samples: &[Sample]) -> bool {
-    samples.len() >= 2
-        && (0..2).all(|i| {
-            let [mean, se] = mean_se(samples.iter().map(|s| s.values[i]));
-            let base = samples.iter().map(|s| s.base_scores[i]).sum::<f64>() / samples.len() as f64;
-            se <= (RELATIVE * mean.abs()).max(BASELINE * base)
-        })
-}
-
-/// Rounded for the output: points to 1e-3.
-fn points(x: [f64; 2]) -> [f64; 2] {
-    [(x[0] * 1000.0).round() / 1000.0, (x[1] * 1000.0).round() / 1000.0]
-}
-
 /// The range factors of a chart's play.
-fn factors(live: &Live<'_>, infos: &[RangeInfo], seeds: &[SeedStats]) -> Result<Vec<RangeFactors>, Error> {
+fn factors(live: &Live<'_>, infos: &[RangeInfo], base: &ExpectedStats) -> Result<Vec<RangeFactors>, Error> {
     let g = live.gekisou.as_ref().ok_or_else(|| Error::Input("aptitude without Gekisou".into()))?;
     let mut lm = LiveModel::new_gekisou(live.master, &[], live.notes, &[], live.params, &g.setup)?;
     let frames = lm.record_range_frames(&live.play, &g.dt)?;
@@ -720,7 +439,8 @@ fn factors(live: &Live<'_>, infos: &[RangeInfo], seeds: &[SeedStats]) -> Result<
                 }
             }
         }
-        let lotteries = mean_se(seeds.iter().map(|s| s.ranges[j].lot_results.iter().sum::<i32>() as f64));
+        let lotteries =
+            estimate(base.ranges[j].lot_results.iter().fold(F64Interval::ZERO, |sum, &x| sum.add(interval(x))));
         out.push(RangeFactors {
             judged_notes: judged,
             just_notes: just,
@@ -733,7 +453,13 @@ fn factors(live: &Live<'_>, infos: &[RangeInfo], seeds: &[SeedStats]) -> Result<
     Ok(out)
 }
 
-/// The aptitude of a chart for Gekisou skills.
+pub(super) struct Inputs<'a> {
+    pub base: &'a ExpectedStats,
+    pub linear: bool,
+    pub score_id: i64,
+    pub judged: i32,
+}
+
 pub(super) fn chart_aptitude(
     live: &Live<'_>,
     kinds: &[Kind],
@@ -741,108 +467,131 @@ pub(super) fn chart_aptitude(
     shapes: &[Shape],
     inp: &Inputs<'_>,
 ) -> Result<ChartAptitude, Error> {
-    if inp.options.max_seeds < 2 || inp.options.cross_seeds == 0 {
-        return Err(Error::Input("aptitude needs at least two maximum seeds and one cross seed".into()));
-    }
+    let master = with_hosts(live.master)?;
+    let measure = with_hosts(live.measure)?;
+    let mut eval = Evaluator::new(live, &master)?;
     let plain = plain_kind(kinds);
-    let mut m = Measure {
-        live,
-        master: with_hosts(live.master)?,
-        measure: with_hosts(live.measure)?,
-        plain,
-        unit: plain.map_or(1.0, |p| kind_factor(kinds[p].effect_type, UNIT_VALUE)),
-        ranges: infos.len(),
-        base: std::collections::HashMap::new(),
-    };
-    let missions: Vec<i64> = infos.iter().map(|r| r.mission).collect();
-    let first_seed = inp.seeds.first().map_or(0, |s| s.seed);
-    let test_seeds = published_seeds(DETERMINISTIC_TEST);
-    let mut batches: Vec<usize> = BATCHES.iter().copied().filter(|&b| b <= inp.options.max_seeds).collect();
-    if batches.last().is_none_or(|&b| b < inp.options.max_seeds) {
-        batches.push(inp.options.max_seeds);
-    }
+    let divisor = f64::from(POWER) * plain.map_or(1.0, |p| kind_factor(kinds[p].effect_type, UNIT_VALUE));
+    let none = vec![None; live.positions];
     let mut variants = Vec::new();
-    for shape in shapes.iter().filter(|s| s.mission == 4 || missions.contains(&s.mission)) {
-        let bands: Vec<Option<bool>> = if shape.band_condition { vec![Some(true), Some(false)] } else { vec![None] };
+    for shape in shapes.iter().filter(|s| s.mission == 4 || infos.iter().any(|r| r.mission == s.mission)) {
+        let bands = if shape.band_condition { vec![Some(true), Some(false)] } else { vec![None] };
         for band in bands {
-            let p = performer(&m.master, shape, band)?;
-            // Equal observations are only a regression check, never proof of determinism. A luck
-            // range can change score factors even for another mission's skill (including its tail).
-            let random_dependency = missions.contains(&2)
-                || shape.effects.iter().any(|e| {
-                    (11000..=11005).contains(&e.effect_type)
-                        || [&e.trigger, &e.condition, &e.release, &e.reset]
-                            .iter()
-                            .flat_map(|g| g.iter().flatten())
-                            .any(|c| c.condition_type == 4011)
+            let p = performer(&master, shape, band)?;
+            let mut formation = vec![Performer::default(); live.positions.max(1)];
+            formation[0] = p;
+            let best = eval.run(&master, &formation, &none, POWER, false, None)?;
+            let perfect = eval.run(&master, &formation, &none, POWER, true, None)?;
+            let score = real(best.final_mean).subtract(interval(inp.base.score));
+            let score_perfect = real(perfect.final_mean).subtract(interval(inp.base.score_perfect));
+            let (_, counters, converted) = live.run_counted(&live.play, &master, &formation, &none, POWER, 0, None)?;
+            let mut ranges = Vec::with_capacity(infos.len());
+            let mut tail = score;
+            let mut tail_perfect = score_perfect;
+            for (((r, rp), base), counter) in
+                best.ranges.iter().zip(&perfect.ranges).zip(&inp.base.ranges).zip(counters)
+            {
+                let range_score = real(r.mean).subtract(interval(base.range_score));
+                let rank_bonus = real(r.bonus_mean).subtract(interval(base.rank_bonus));
+                let range_score_perfect = real(rp.mean).subtract(interval(base.range_score_perfect));
+                let rank_bonus_perfect = real(rp.bonus_mean).subtract(interval(base.rank_bonus_perfect));
+                tail = tail.subtract(range_score).subtract(rank_bonus);
+                tail_perfect = tail_perfect.subtract(range_score_perfect).subtract(rank_bonus_perfect);
+                ranges.push(RangeDelta {
+                    range_score: estimate(range_score),
+                    rank_bonus: estimate(rank_bonus),
+                    rank_bonus_perfect: estimate(rank_bonus_perfect),
+                    range_score_perfect: estimate(range_score_perfect),
+                    max_combo: [f64::from(counter.max_combo - base.max_combo), 0.0],
+                    just_count: [f64::from(counter.just_count - base.just_count), 0.0],
+                    luck_points: estimate(
+                        real(r.luck_points_mean.expect("range indicators requested"))
+                            .subtract(interval(base.luck_points)),
+                    ),
                 });
-            let mut test = Vec::with_capacity(test_seeds.len());
-            if !random_dependency {
-                for &s in &test_seeds {
-                    test.push(m.sample(&p, s, false)?.values);
+            }
+            let mut weights = plain.map(|_| vec![[0.0; 2]; live.positions]);
+            let mut range_weights =
+                (plain.is_some() && inp.linear).then(|| vec![vec![[0.0; 2]; infos.len()]; live.positions]);
+            if let Some(plain) = plain {
+                for k in 0..live.positions {
+                    let mut live_skills = none.clone();
+                    live_skills[k] = Some(KIND_SKILL_BASE - plain as i64);
+                    let cross = eval.run(&measure, &formation, &live_skills, POWER, false, None)?;
+                    weights.as_mut().unwrap()[k] = estimate(
+                        scaled(delta(cross.final_mean, best.final_mean), divisor)?
+                            .subtract(interval(inp.base.weights[plain][k])),
+                    );
+                    if let Some(rw) = &mut range_weights {
+                        let base_rw = inp
+                            .base
+                            .range_weights
+                            .as_ref()
+                            .and_then(|r| r[plain].as_ref())
+                            .expect("plain range weights");
+                        for (i, (r, b)) in cross.ranges.iter().zip(&best.ranges).enumerate() {
+                            rw[k][i] =
+                                estimate(scaled(delta(r.mean, b.mean), divisor)?.subtract(interval(base_rw[k][i])));
+                        }
+                    }
                 }
             }
-            let deterministic = !random_dependency && test.windows(2).all(|w| w[0] == w[1]);
-            let mut samples: Vec<Sample> = Vec::new();
-            let mut met = true;
-            if deterministic {
-                samples.push(m.sample(&p, first_seed, true)?);
-            } else {
-                met = false;
-                for &n in &batches {
-                    let seeds = published_seeds(n);
-                    for (i, &s) in seeds.iter().enumerate().skip(samples.len()) {
-                        samples.push(m.sample(&p, s, i < inp.options.cross_seeds)?);
-                    }
-                    if score_targets_met(&samples) {
-                        met = true;
-                        break;
-                    }
-                }
-            }
-            let crossed: Vec<&Sample> = samples.iter().filter(|s| s.cross.is_some()).collect();
-            let at = |i: usize| points(mean_se(samples.iter().map(move |s| s.values[i])));
-            let ranges = (0..infos.len())
-                .map(|j| {
-                    let o = 5 + 6 * j;
-                    RangeDelta {
-                        range_score: at(o),
-                        rank_bonus: at(o + 1),
-                        range_score_perfect: at(o + 2),
-                        max_combo: at(o + 3),
-                        just_count: at(o + 4),
-                        luck_points: at(o + 5),
-                    }
-                })
-                .collect();
-            let weights = plain.map(|_| {
-                (0..live.positions)
-                    .map(|k| mean_se(crossed.iter().map(|s| s.cross.as_ref().expect("cross").0[k])))
-                    .collect()
-            });
-            let range_weights = (plain.is_some() && inp.linear).then(|| {
-                (0..live.positions)
-                    .map(|k| {
-                        (0..infos.len())
-                            .map(|j| mean_se(crossed.iter().map(|s| s.cross.as_ref().expect("cross").1[k][j])))
-                            .collect()
-                    })
-                    .collect()
-            });
             let salt = inp.score_id as u64 ^ ((shape.id as u64) << 32) ^ (band.map_or(0, |b| 1 + b as u64) << 48);
-            let check = check(&mut m, kinds, infos, inp, &p, &samples[0], salt)?;
+            let mut rng = Rng(APT_CHECK_SALT ^ salt);
+            let mut rank_rng = Rng(APT_RANK_SALT ^ salt);
+            let ranks: Vec<_> =
+                infos.iter().map(|_| if inp.linear { 1 + rank_rng.below(super::RANKS) as i32 } else { 1 }).collect();
+            let usable: Vec<_> = plain.into_iter().collect();
+            let (deck, rows) = check_deck(kinds, &usable, live.positions, &mut rng);
+            let check_master = Live::master_with(&master, &rows);
+            let mut baseline = interval(inp.base.score);
+            let mut gain = score;
+            let mut shifts = vec![0.0; infos.len()];
+            if inp.linear {
+                gain = tail;
+                for (i, ((base, info), &rank)) in inp.base.ranges.iter().zip(infos).zip(&ranks).enumerate() {
+                    let pr = info.percent(rank)? as f64 / 100.0;
+                    shifts[i] = (info.percent(rank)? - info.percent(1)?) as f64 / 100.0;
+                    baseline = baseline
+                        .subtract(interval(base.rank_bonus))
+                        .add(interval(base.range_score).multiply(F64Interval::point(pr)?));
+                    gain = gain.add(interval(ranges[i].range_score).multiply(F64Interval::point(1.0 + pr)?));
+                }
+            }
+            let check = eval.check(
+                kinds,
+                &check_master,
+                &formation,
+                &deck,
+                Some(&ranks),
+                infos,
+                scaled(baseline.add(gain), f64::from(POWER))?,
+                |_, k| {
+                    let plain = plain.expect("the check deck only uses the plain kind");
+                    let mut w = interval(inp.base.weights[plain][k]).add(interval(weights.as_ref().unwrap()[k]));
+                    if let Some(rw) = &range_weights {
+                        let base_rw = inp.base.range_weights.as_ref().unwrap()[plain].as_ref().unwrap();
+                        for (i, &d) in shifts.iter().enumerate() {
+                            w = w.add(
+                                interval(base_rw[k][i])
+                                    .add(interval(rw[k][i]))
+                                    .multiply(F64Interval::point(d).unwrap()),
+                            );
+                        }
+                    }
+                    w
+                },
+                f64::from(inp.judged) + MAX_GEKISOU_FEVERS as f64 + 2.0 * infos.len() as f64,
+                2.0 * infos.len() as f64,
+            )?;
             variants.push(Variant {
                 shape: shape.id,
                 band_match: band,
-                deterministic,
-                seeds: samples.len(),
-                se_target_met: met,
-                cross_seeds: crossed.len(),
-                score: at(0),
-                score_perfect: at(1),
-                tail: at(2),
-                tail_perfect: at(3),
-                converted: at(4),
+                score: estimate(score),
+                score_perfect: estimate(score_perfect),
+                tail: estimate(tail),
+                tail_perfect: estimate(tail_perfect),
+                converted: [converted as f64, 0.0],
                 ranges,
                 weights,
                 range_weights,
@@ -850,91 +599,5 @@ pub(super) fn chart_aptitude(
             });
         }
     }
-    Ok(ChartAptitude { factors: factors(live, infos, inp.seeds)?, variants })
-}
-
-/// The check of a variant on its first seed: the shape with a random plain deck at random ranks (rank 1 where the
-/// ranks do not follow linearly) at the check power, against the linear prediction from that seed's numbers.
-fn check(
-    m: &mut Measure<'_, '_>,
-    kinds: &[Kind],
-    infos: &[RangeInfo],
-    inp: &Inputs<'_>,
-    p: &Performer,
-    s: &Sample,
-    salt: u64,
-) -> Result<VariantCheck, Error> {
-    let live = m.live;
-    let b = m.base(s.seed, true)?.clone();
-    let mut rng = Rng(APT_CHECK_SALT ^ salt);
-    let mut rank_rng = Rng(APT_RANK_SALT ^ salt);
-    let ranks: Vec<i32> =
-        infos.iter().map(|_| if inp.linear { 1 + rank_rng.below(super::RANKS) as i32 } else { 1 }).collect();
-    let mut d = Vec::with_capacity(infos.len());
-    for (info, &r) in infos.iter().zip(&ranks) {
-        d.push(((info.percent(r)? - info.percent(1)?) as f64 / 100.0, info.percent(r)? as f64 / 100.0));
-    }
-    // the base at these ranks (exact) and the shape's increment by the linear rank formula
-    let mut base = b.just.score as i64;
-    for (r, info_r) in b.just.ranges.iter().zip(infos.iter().zip(&ranks)) {
-        let (info, &rank) = info_r;
-        base += range_score(r) as i64 * info.percent(rank)? / 100 - r.rank_bonus.unwrap_or(0) as i64;
-    }
-    let mut delta = s.values[2];
-    for (j, &(_, pr)) in d.iter().enumerate() {
-        delta += s.values[5 + 6 * j] * (1.0 + pr);
-    }
-    let usable: Vec<usize> = m.plain.into_iter().collect();
-    let (deck, rows) = check_deck(kinds, &usable, live.positions, &mut rng);
-    let master = Live::master_with(&m.master, &rows);
-    let unit = m.unit;
-    let weight = |_: usize, k: usize| -> f64 {
-        let (Some(bc), Some((dw, drw))) = (&b.cross, &s.cross) else { return f64::NAN };
-        let w0 = (bc[k].0 as f64 - b.just.score as f64) / (POWER as f64 * unit);
-        let mut w = w0 + dw[k];
-        for (j, &(dp, _)) in d.iter().enumerate() {
-            let rw0 = (bc[k].1[j] as f64 - range_score(&b.just.ranges[j]) as f64) / (POWER as f64 * unit);
-            w += dp * (rw0 + drw[k][j]);
-        }
-        w
-    };
-    let floors = inp.judged as f64 + MAX_GEKISOU_FEVERS as f64 + 2.0 * infos.len() as f64;
-    let slack = 2.0 * infos.len() as f64;
-    let confirmations: Vec<(i32, i64)> =
-        ranks.iter().zip(infos).map(|(&r, info)| Ok((r, info.percent(r)?))).collect::<Result<_, Error>>()?;
-    let external = inp.linear.then_some(confirmations.as_slice());
-    let per_power = (base as f64 + delta) / POWER as f64;
-    let c: Checked = live
-        .check_with(kinds, &master, std::slice::from_ref(p), &deck, s.seed, external, per_power, weight, floors, slack)?
-        .within(|| format!("Gekisou aptitude, seed {} at ranks {ranks:?}", s.seed))?;
-    Ok(VariantCheck { seed: s.seed, ranks, deck, exact: c.exact, predicted: c.predicted, bound: c.bound })
-}
-
-#[cfg(test)]
-mod sampling_tests {
-    use super::*;
-
-    #[test]
-    fn perfect_score_uses_its_own_baseline_and_must_also_converge() {
-        let mut samples: Vec<_> = (0..32)
-            .map(|i| Sample {
-                seed: i,
-                base_scores: [1_000_000.0, 1_000.0],
-                values: vec![100.0, if i % 2 == 0 { -200.0 } else { 200.0 }],
-                cross: None,
-            })
-            .collect();
-        assert_eq!(mean_se(samples.iter().map(|s| s.values[0])), [100.0, 0.0]);
-        // Checking only the first play, or using its much larger baseline for Perfect, would accept this.
-        assert!(!score_targets_met(&samples));
-        for sample in &mut samples {
-            sample.values[1] = 50.0;
-        }
-        assert!(score_targets_met(&samples));
-    }
-
-    #[test]
-    fn random_sampling_never_calls_a_single_observation_converged() {
-        assert!(!score_targets_met(&[Sample { seed: 0, base_scores: [1000.0; 2], values: vec![0.0; 2], cross: None }]));
-    }
+    Ok(ChartAptitude { factors: factors(live, infos, inp.base)?, variants })
 }

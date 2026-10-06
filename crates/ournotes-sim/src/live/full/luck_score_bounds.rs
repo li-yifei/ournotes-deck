@@ -250,6 +250,9 @@ pub struct LuckRangeScoreBounds {
     pub support: IntegerBounds,
     pub bonus_mean: RealBounds,
     pub bonus_support: IntegerBounds,
+    pub luck_points_mean: Option<RealBounds>,
+    /// Expected Miss, Hit, Super Hit and Critical counts.
+    pub lot_results_mean: Option<[RealBounds; 4]>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -660,6 +663,8 @@ pub fn luck_score_bounds_with_ranking(
         ranking,
         true,
         None,
+        false,
+        None,
     )
 }
 
@@ -709,6 +714,8 @@ pub fn luck_score_summary_with_curves(
         ranking,
         false,
         curves,
+        false,
+        None,
     )?;
     Ok(LuckScoreSummary {
         final_mean: bounds.final_mean,
@@ -718,6 +725,131 @@ pub fn luck_score_summary_with_curves(
         exact_final_life: bounds.exact_final_life,
         probability_peak_states: bounds.probability_peak_states,
         probability_transitions: bounds.probability_transitions,
+    })
+}
+
+/// The expected final score and range scores of a solo play under the independent nominal lottery law.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LuckScoreExpectation {
+    pub final_mean: RealBounds,
+    /// A singleton proves a constant score.
+    pub final_support: IntegerBounds,
+    /// One per Gekisou range, in range order: its score and rank bonus.
+    pub ranges: Vec<LuckRangeScoreBounds>,
+}
+
+/// [`luck_score_summary_with_ranking`] of a solo play with the range enclosures. `skills` is [`luck_skills`] of
+/// `master`.
+#[allow(clippy::too_many_arguments)]
+pub fn luck_score_expectation(
+    master: &Master,
+    skills: &LuckSkills,
+    deck: &[Performer],
+    notes: &[LiveNote],
+    events: &[(i32, i32)],
+    params: LiveParams,
+    setup: &GekisouSetup,
+    play: &LivePlay,
+    delta_times: &[f32],
+) -> Result<LuckScoreExpectation, Error> {
+    luck_score_expectation_with_curves(
+        master,
+        skills,
+        deck,
+        notes,
+        events,
+        params,
+        setup,
+        play,
+        delta_times,
+        None,
+        None,
+    )
+}
+
+/// Range expectations under an explicit rank-arrival timeline, sharing certified lottery curves when supplied.
+#[allow(clippy::too_many_arguments)]
+pub fn luck_score_expectation_with_curves(
+    master: &Master,
+    skills: &LuckSkills,
+    deck: &[Performer],
+    notes: &[LiveNote],
+    events: &[(i32, i32)],
+    params: LiveParams,
+    setup: &GekisouSetup,
+    play: &LivePlay,
+    delta_times: &[f32],
+    ranking: Option<&[crate::replay::RankConfirmation]>,
+    curves: Option<&mut LuckDpCache>,
+) -> Result<LuckScoreExpectation, Error> {
+    let mut bounds = luck_score_bounds_internal(
+        master,
+        skills,
+        deck,
+        notes,
+        events,
+        params,
+        setup,
+        play,
+        delta_times,
+        ranking,
+        false,
+        curves,
+        false,
+        None,
+    )?;
+    bounds.ranges.sort_by_key(|r| r.range);
+    if bounds.ranges.len() != setup.fevers.len() || bounds.ranges.iter().enumerate().any(|(i, r)| r.range != i) {
+        return Err(refuse("a Gekisou range has no rank enclosure"));
+    }
+    Ok(LuckScoreExpectation {
+        final_mean: bounds.final_mean,
+        final_support: bounds.final_support,
+        ranges: bounds.ranges,
+    })
+}
+
+/// Chart measurements vary ordinary score-only rows while retaining this curve's lottery dependencies.
+/// The caller keeps the formation, play, power and rank timeline identical to the curve's inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn luck_score_expectation_for_chart(
+    master: &Master,
+    skills: &LuckSkills,
+    deck: &[Performer],
+    notes: &[LiveNote],
+    events: &[(i32, i32)],
+    params: LiveParams,
+    setup: &GekisouSetup,
+    play: &LivePlay,
+    delta_times: &[f32],
+    ranking: Option<&[crate::replay::RankConfirmation]>,
+    probability: std::sync::Arc<LuckDpCertifiedResult>,
+) -> Result<LuckScoreExpectation, Error> {
+    let mut bounds = luck_score_bounds_internal(
+        master,
+        skills,
+        deck,
+        notes,
+        events,
+        params,
+        setup,
+        play,
+        delta_times,
+        ranking,
+        false,
+        None,
+        true,
+        Some(probability),
+    )?;
+    bounds.ranges.sort_by_key(|r| r.range);
+    if bounds.ranges.len() != setup.fevers.len() || bounds.ranges.iter().enumerate().any(|(i, r)| r.range != i) {
+        return Err(refuse("a Gekisou range has no rank enclosure"));
+    }
+    Ok(LuckScoreExpectation {
+        final_mean: bounds.final_mean,
+        final_support: bounds.final_support,
+        ranges: bounds.ranges,
     })
 }
 
@@ -754,11 +886,17 @@ fn luck_score_bounds_internal(
     ranking: Option<&[crate::replay::RankConfirmation]>,
     details: bool,
     curves: Option<&mut LuckDpCache>,
+    counterfactual_solo: bool,
+    probability: Option<std::sync::Arc<LuckDpCertifiedResult>>,
 ) -> Result<LuckScoreBounds, Error> {
     #[cfg(feature = "search-diagnostics")]
     let phase_start = std::time::Instant::now();
     let mut model = if let Some(ranking) = ranking {
-        let mut model = LiveModel::new_gekisou_external(master, deck, notes, events, params, setup)?;
+        let mut model = if counterfactual_solo {
+            LiveModel::new_gekisou_ranked(master, deck, notes, events, params, setup)?
+        } else {
+            LiveModel::new_gekisou_external(master, deck, notes, events, params, setup)?
+        };
         model.set_rank_confirmation_timeline(ranking)?;
         model
     } else {
@@ -775,17 +913,41 @@ fn luck_score_bounds_internal(
     // machine/gauge/points. check_recorder excludes any other stochastic writer and direct-7021 probes remain
     // false. Consequently these draws cannot reach score, judgements, life or fixed rank arrivals; this is a
     // deterministic score law even when native.draws() > 0. It is not a fixed-seed approximation.
-    let probability = if !has_luck {
+    let collect_moments = details || counterfactual_solo;
+    let probability = if let Some(probability) = probability {
+        probability
+    } else if !has_luck {
         std::sync::Arc::new(LuckDpCertifiedResult {
             steps: Vec::new(),
             probes: vec![false; skills.shapes.len()],
+            range_moments: if collect_moments {
+                vec![super::luck_dp::LuckRangeMoments::default(); setup.fevers.len()]
+            } else {
+                Vec::new()
+            },
             peak_states: 1,
             transitions: 0,
         })
     } else if let Some(curves) = curves {
-        curves.certified(master, skills, notes, events, params, setup, play, delta_times, deck, None, ranking)?
+        if collect_moments {
+            curves.certified_with_moments(
+                master,
+                skills,
+                notes,
+                events,
+                params,
+                setup,
+                play,
+                delta_times,
+                deck,
+                None,
+                ranking,
+            )?
+        } else {
+            curves.certified(master, skills, notes, events, params, setup, play, delta_times, deck, None, ranking)?
+        }
     } else {
-        std::sync::Arc::new(luck_rush_dp_certified_with_ranking(
+        std::sync::Arc::new(luck_dp::certified_mode(
             master,
             skills,
             notes,
@@ -797,6 +959,7 @@ fn luck_score_bounds_internal(
             deck,
             None,
             ranking,
+            collect_moments,
         )?)
     };
     #[cfg(feature = "search-diagnostics")]
@@ -850,7 +1013,9 @@ fn luck_score_bounds_internal(
     let trace = model.score.bounds_trace.take().expect("bounds recorder enabled");
     let query_limit = (play.frames.len() as u64)
         .checked_mul(2)
-        .and_then(|value| value.checked_add(if ranking.is_none() { 2 * setup.fevers.len() as u64 } else { 0 }))
+        .and_then(|value| {
+            value.checked_add(if ranking.is_none() || counterfactual_solo { 2 * setup.fevers.len() as u64 } else { 0 })
+        })
         .ok_or_else(|| Error::Capacity("score query count overflow".into()))?;
     if trace.queries as u64 > query_limit {
         return Err(refuse("unaccounted native calculate entry point"));
@@ -946,6 +1111,8 @@ fn luck_score_bounds_internal(
                     support: support.into(),
                     bonus_mean: bonus.into(),
                     bonus_support: bonus_support.into(),
+                    luck_points_mean: probability.range_moments.get(*range).map(|m| m.luck_points.into()),
+                    lot_results_mean: probability.range_moments.get(*range).map(|m| m.lot_results.map(Into::into)),
                 });
             }
             BoundsEvent::Query { time_ms, to } => {
@@ -1273,6 +1440,101 @@ mod tests {
     }
 
     #[test]
+    fn probabilistic_start_guarantees_match_the_full_nominal_law() {
+        for (minimum, percent) in [(2, 5), (2, 60), (3, 5), (3, 60)] {
+            let (mut master, notes, params, setup, play, delta) = fixture();
+            master.gekisou_luck_bonus_lots = (0..5)
+                .flat_map(|kind| {
+                    (0..4).map(move |result| crate::master::LuckBonusLotRow {
+                        id: kind * 4 + result + 1,
+                        chance_lot_type: kind,
+                        lot_result: result,
+                        weight: 1,
+                    })
+                })
+                .collect();
+            for (id, kind, values) in [(1, 7010, vec![]), (2, 4011, vec![percent]), (3, 7013, vec![])] {
+                master.skill_conditions.push(
+                    serde_json::from_value(json!({
+                        "_id": id, "_conditionType": kind, "_conditionValues": values,
+                        "_conditionTargetIDs": [], "_isPositive": true,
+                    }))
+                    .unwrap(),
+                );
+                master.skill_condition_sets.push(
+                    serde_json::from_value(json!({
+                        "_id": id, "_group": id, "_conditionIds": [id],
+                    }))
+                    .unwrap(),
+                );
+            }
+            master.skill_effect_settings.push(
+                serde_json::from_value(json!({
+                    "_id": 1, "_skillEffectType": 11005, "_phase": 1,
+                }))
+                .unwrap(),
+            );
+            let skill = crate::master::SkillRow { id: 1, gekisou_mission_type: 2, ..Default::default() };
+            master.gekisou_skills.push(skill.clone());
+            master.gekisou_support_skills.push(skill);
+            master.gekisou_support_skill_effects.push(
+                serde_json::from_value(json!({
+                    "_id": 1, "_gekisouSupportSkillID": 1, "_level": 1,
+                    "_skillTriggerType": 1, "_skillTriggerConditionGroup": 1,
+                    "_skillConditionGroup": 2, "_skillReleaseConditionGroup": 3,
+                    "_skillEffectType": 11005, "_effectValue": minimum, "_effectLimitCount": 1,
+                }))
+                .unwrap(),
+            );
+            master.reindex().unwrap();
+            let deck = [Performer {
+                gekisou_skill: Some((1, 1)),
+                gekisou_mission_type: 2,
+                gekisou_support_skills: vec![(1, 1)],
+                ..Default::default()
+            }];
+            let skills = luck_skills(&master).unwrap();
+            let dp =
+                luck_score_expectation(&master, &skills, &deck, &notes, &[], params, &setup, &play, &delta).unwrap();
+            let mut expected = 0.0;
+            for threshold in [0, 1001] {
+                let mut branch_master = master.clone();
+                let condition = branch_master.skill_conditions.iter_mut().find(|row| row.id == 2).unwrap();
+                condition.condition_type = 2001;
+                condition.condition_values = vec![threshold];
+                branch_master.reindex().unwrap();
+                let attempt = super::super::luck_exact::luck_exact_law_with_ranking(
+                    &branch_master,
+                    &deck,
+                    &notes,
+                    &[],
+                    params,
+                    &setup,
+                    &play,
+                    &delta,
+                    None,
+                    &mut super::super::luck_exact::LuckExactBudget::default(),
+                    || false,
+                )
+                .unwrap();
+                let law = attempt.law.expect("the finite nominal tree completes");
+                let probability = f64::from(percent as f32 / 100.0);
+                expected += (if threshold == 0 { probability } else { 1.0 - probability })
+                    * law
+                        .atoms()
+                        .iter()
+                        .map(|atom| f64::from(atom.score) * atom.mass.numerator as f64 / atom.mass.denominator as f64)
+                        .sum::<f64>();
+            }
+            assert!(
+                dp.final_mean.lower <= expected && expected <= dp.final_mean.upper,
+                "minimum={minimum}, percent={percent}, nominal={expected}, dp={:?}",
+                dp.final_mean
+            );
+        }
+    }
+
+    #[test]
     fn later_native_ranges_cancel_old_random_bonuses_and_keep_all_seed_scores() {
         let (mut master, _, mut params, mut setup, _, _) = fixture();
         master.gekisou_luck_bonus_lots = (0..5)
@@ -1486,6 +1748,8 @@ mod tests {
             &setup,
             &play,
             &delta,
+            None,
+            false,
             None,
             false,
             None,

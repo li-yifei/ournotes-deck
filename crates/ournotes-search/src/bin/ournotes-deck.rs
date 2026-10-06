@@ -24,8 +24,8 @@ const USAGE: &str = "usage:
   ournotes-deck skip  --data FILE --roster FILE --score ID [common options]
   ournotes-deck live  --data FILE --roster FILE --score ID --expectation finite --seed-law FILE [--play FILE]
                       [--gekisou] [common options]
-  ournotes-deck chart-stats --data FILE [--seeds N] [--no-gekisou-aptitude] [--aptitude-max-seeds N]
-                      [--aptitude-cross-seeds N] [--charts ID[,ID...]] [--jobs N] [-o FILE]
+  ournotes-deck chart-stats --data FILE [--seeds N] [--no-gekisou-aptitude]
+                      [--charts ID[,ID...]] [--jobs N] [-o FILE]
 recommend consumes the JSON recommendation request and writes the unified recommendation result.
 Use ournotes-deck recommend --help for its input and progress options.
 --data is a deck data file (nnnotes.deck-data/1). live ranks by the expected score of the whole-live simulation
@@ -37,13 +37,12 @@ conditional items also require --resource-type ID --resource-id ID and context.e
 scenario options: --scenario free|mission|battle|arena|challenge --scenario-music ID --context FILE
 --scenario-music is the special row ID for arena/challenge; --score always denotes the base chart.
 --context uses explicit powerSnapshot.eventIds and separate resultClock normalized DateTime ticks.
-chart-stats measures every chart on the whole-live simulation (ournotes-deck.chart-stats/2): the no-skill score and
-the weight of every score-up kind at every position, with Gekisou on per seed (--seeds N for charts with a luck range,
-default 8; rank 1, range weights for the other ranks, the Perfect play's scores) and with Gekisou off (offSeeds); and
-the chart's aptitude for Gekisou skills: each skill shape of its missions measured alone, not a best formation.
---aptitude-max-seeds N caps adaptive sampling (default 65536); --aptitude-cross-seeds N caps ordinary-skill cross
-terms (default 64). --no-gekisou-aptitude skips aptitude, leaving both aptitude fields null; baseline stats remain.
-Increments are seed means with standard errors, not the game's expectation; multiple skill increments cannot be added.
+chart-stats measures every chart on the whole-live simulation (ournotes-deck.chart-stats/3): nominal Gekisou
+expectations and score-up weights, range weights for fixed ranks, the Perfect play's scores and deterministic
+Free Live figures (offSeeds). Each Gekisou skill shape is measured alone, including plain score-up cross terms.
+Estimates are [center, outward interval half-width] under independent nominal lottery and skill probabilities.
+--seeds N controls replay seeds for charts with a luck range (default 8); statistics use nominal expectations.
+--no-gekisou-aptitude leaves both aptitude fields null and includes the baseline measurements.
 --charts keeps the listed score ids in file order; --jobs N measures N charts at once (default 1).
 -o FILE writes JSON to a file; without it JSON goes to stdout.
 common options: -k N (default 10), --leader ID, --include ID[,ID...], --exclude ID[,ID...],
@@ -71,16 +70,7 @@ fn chart_stats(args: &[String]) -> Result<Option<serde_json::Value>, String> {
         match a {
             "--data" => data = Some(val()?),
             "--seeds" => seeds = Some(val()?.trim().parse::<usize>().map_err(|_| "bad --seeds".to_string())?),
-            "--no-gekisou-aptitude" => options.aptitude = None,
-            "--aptitude-max-seeds" | "--aptitude-cross-seeds" => {
-                let n = val()?.trim().parse::<usize>().map_err(|_| format!("bad {a}"))?;
-                let x = options.aptitude.get_or_insert_with(Default::default);
-                if a == "--aptitude-max-seeds" {
-                    x.max_seeds = n;
-                } else {
-                    x.cross_seeds = n;
-                }
-            }
+            "--no-gekisou-aptitude" => options.aptitude = false,
             "--charts" => only = Some(ids(&val()?)?),
             "--jobs" => jobs = val()?.trim().parse::<usize>().map_err(|_| "bad --jobs".to_string())?.max(1),
             "-o" | "--out" => out = Some(val()?),
@@ -94,7 +84,7 @@ fn chart_stats(args: &[String]) -> Result<Option<serde_json::Value>, String> {
         data.charts.retain(|c| only.contains(&c.score_id));
     }
     if let Some(n) = seeds {
-        options.seeds = n;
+        options.replay_seeds = n;
     }
     let doc = if jobs <= 1 {
         ournotes_sim::chartstats::document_with(&data, &options).map_err(|e| e.to_string())?

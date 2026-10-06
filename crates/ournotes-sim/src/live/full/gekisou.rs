@@ -50,7 +50,7 @@ const CHANCE_LOW: usize = 1;
 /// Lot type by rush combo 0..=3 (none, first, second, third rush).
 const LOT_TYPE_BY_RUSH: [usize; 4] = [NONE_LOT, 4, 3, 2];
 /// Bonus points of a Hit, Super Hit and Critical.
-const BONUS_POINT_BY_RESULT: [i32; 3] = [5, 10, 10];
+pub(super) const BONUS_POINT_BY_RESULT: [i32; 3] = [5, 10, 10];
 
 const COMPLETE_DELAY_MS: i64 = 500;
 const STANDBY_MS: i32 = 4001;
