@@ -58,14 +58,15 @@ pub(crate) fn recommend_hooked_started(
     start: Instant,
 ) -> Result<RecommendationOutcome, Error> {
     #[cfg(not(target_arch = "wasm32"))]
-    if progress.is_none() && crate::parallel::native_enabled() {
+    if crate::parallel::native_enabled() {
         return crate::parallel::recommend_started(
             data,
             roster,
             request,
             crate::parallel::native_workers(),
-            crate::parallel::Cancellation::default(),
+            crate::parallel::native_cancellation(),
             start,
+            progress,
         );
     }
     let built = crate::handler::build_card_pool(data, roster, request)?;

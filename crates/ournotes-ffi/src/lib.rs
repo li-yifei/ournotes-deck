@@ -7,10 +7,15 @@ use ournotes_search::{
 };
 use ournotes_sim::{cards::Roster, data::DeckData};
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString, c_char},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 /// Admit one CPU search request, which owns a configurable number of internal
@@ -24,6 +29,18 @@ impl SearchPool {
     fn new() -> Self {
         // One admitted request owns the native half-core worker allowance.
         Self { slots: Mutex::new(1), wake: Condvar::new() }
+    }
+
+    fn acquire_cancellable(&self, cancel: &parallel::Cancellation) -> Option<SearchPermit<'_>> {
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        while *slots == 0 && !cancel.is_cancelled() {
+            slots = self.wake.wait_timeout(slots, Duration::from_millis(25)).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        if cancel.is_cancelled() {
+            return None;
+        }
+        *slots -= 1;
+        Some(SearchPermit { pool: self })
     }
 
     fn acquire(&self) -> SearchPermit<'_> {
@@ -292,6 +309,138 @@ pub unsafe extern "C" fn ournotes_recommend_account_json_with_threads(
                 .join()
                 .map_err(|_| "native account search worker panicked".to_owned())?
         })
+    })
+}
+
+#[derive(Default)]
+struct AccountJobState {
+    progress: Option<String>,
+    result: Option<String>,
+    error: Option<String>,
+    finished: Option<Instant>,
+}
+struct AccountJob {
+    cancel: parallel::Cancellation,
+    state: Mutex<AccountJobState>,
+}
+static ACCOUNT_JOBS: OnceLock<Mutex<HashMap<String, Arc<AccountJob>>>> = OnceLock::new();
+static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
+fn account_jobs() -> &'static Mutex<HashMap<String, Arc<AccountJob>>> {
+    ACCOUNT_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Start an account search. All inputs are copied before returning; poll receives
+/// the latest genuine candidate answer, and completion removes the job on poll.
+/// Returned UTF-8 JSON owns its buffer; free it with `ournotes_free_string`.
+///
+/// # Safety
+/// Inputs must be readable NUL-terminated UTF-8 strings for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ournotes_account_job_start_json(
+    data_path: *const c_char,
+    account_json: *const c_char,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded_json(|| {
+        let path = input(data_path)?;
+        let account = input(account_json)?;
+        let request = input(request_json)?;
+        let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed).to_string();
+        let job =
+            Arc::new(AccountJob { cancel: parallel::Cancellation::default(), state: Mutex::new(Default::default()) });
+        {
+            let mut jobs = account_jobs().lock().unwrap_or_else(|p| p.into_inner());
+            jobs.retain(|_, job| {
+                job.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .finished
+                    .is_none_or(|t| t.elapsed() < Duration::from_secs(60))
+            });
+            if jobs.len() >= 64 {
+                return Err("native account job limit reached".into());
+            }
+            jobs.insert(id.clone(), job.clone());
+        }
+        let worker_id = id.clone();
+        if let Err(error) = std::thread::Builder::new().name(format!("ournotes-account-{id}")).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _permit =
+                    search_pool().acquire_cancellable(&job.cancel).ok_or("native account search cancelled")?;
+                let data = DeckData::from_path(path).map_err(|e| e.to_string())?;
+                let mut report = |answer: &engine::Answer| {
+                    if let Ok(text) = serde_json::to_string(answer) {
+                        job.state.lock().unwrap_or_else(|p| p.into_inner()).progress = Some(text);
+                    }
+                };
+                let answer = parallel::with_native_threads(parallel::default_workers(), || {
+                    parallel::with_native_cancellation(job.cancel.clone(), || {
+                        engine::recommend_account(
+                            &data,
+                            &account,
+                            &request,
+                            Some(engine::AnswerProgress { interval: Duration::from_millis(200), report: &mut report }),
+                        )
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+                serde_json::to_string(&answer).map_err(|e| e.to_string())
+            }))
+            .unwrap_or_else(|_| Err("native account search worker panicked".into()));
+            let mut state = job.state.lock().unwrap_or_else(|p| p.into_inner());
+            match result {
+                Ok(result) => state.result = Some(result),
+                Err(error) => state.error = Some(error),
+            }
+            state.finished = Some(Instant::now());
+        }) {
+            account_jobs().lock().unwrap_or_else(|p| p.into_inner()).remove(&worker_id);
+            return Err(format!("start native account job: {error}"));
+        }
+        Ok(serde_json::json!({"jobId":id}).to_string())
+    })
+}
+
+/// Drain the latest progress and final answer. Completed jobs are removed.
+/// # Safety
+/// `job_id` must be readable NUL-terminated UTF-8 for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ournotes_account_job_poll_json(job_id: *const c_char) -> *mut c_char {
+    guarded_json(|| {
+        let id = input(job_id)?;
+        let mut jobs = account_jobs().lock().unwrap_or_else(|p| p.into_inner());
+        let job = jobs.get(&id).cloned().ok_or("unknown native account job")?;
+        let mut state = job.state.lock().unwrap_or_else(|p| p.into_inner());
+        let done = state.finished.is_some();
+        let mut out = serde_json::json!({"done":done});
+        if let Some(progress) = state.progress.take() {
+            out["progressJson"] = progress.into();
+        }
+        if let Some(result) = state.result.take() {
+            out["resultJson"] = result.into();
+        }
+        if let Some(error) = state.error.take() {
+            out["error"] = error.into();
+        }
+        if done {
+            jobs.remove(&id);
+        }
+        Ok(out.to_string())
+    })
+}
+
+/// Cancel running or queued work and immediately release the polling registry.
+/// The worker owns its remaining lifetime until cooperative checks finish it.
+/// # Safety
+/// `job_id` must be readable NUL-terminated UTF-8 for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ournotes_account_job_cancel_json(job_id: *const c_char) -> *mut c_char {
+    guarded_json(|| {
+        let id = input(job_id)?;
+        if let Some(job) = account_jobs().lock().unwrap_or_else(|p| p.into_inner()).remove(&id) {
+            job.cancel.cancel();
+        }
+        Ok(serde_json::json!({"cancelled":true}).to_string())
     })
 }
 
