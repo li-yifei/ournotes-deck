@@ -534,40 +534,60 @@ pub fn evaluate_luck_context(
     mut curves: Option<&mut ournotes_sim::live::full::LuckDpCache>,
     cancelled: impl FnMut() -> bool,
 ) -> Result<Option<CertifiedEvaluation>, Error> {
+    input.gekisou.as_ref().ok_or_else(|| invalid("LUCK requires Gekisou context"))?;
+    evaluate_orders(map, |order| luck_order(master, skills, input, order, curves.as_deref_mut()), cancelled)
+}
+
+fn luck_order(
+    master: &ournotes_sim::master::Master,
+    skills: &ournotes_sim::live::full::LuckSkills,
+    input: &super::expectation::FiniteSeedContext,
+    order: [usize; 5],
+    curves: Option<&mut ournotes_sim::live::full::LuckDpCache>,
+) -> Result<OrderScoreInterval, Error> {
     let setup = input.gekisou.as_ref().ok_or_else(|| invalid("LUCK requires Gekisou context"))?;
-    evaluate_orders(
-        map,
-        |order| {
-            let performers = order.map(|slot| input.performers[slot].clone());
-            let summary = ournotes_sim::live::full::luck_score_summary_with_curves(
-                master,
-                skills,
-                &performers,
-                &input.notes,
-                &input.events,
-                input.params,
-                setup,
-                &input.play,
-                &input.delta_times,
-                input.rank_confirmations.as_deref(),
-                curves.as_deref_mut(),
-            )?;
-            let support = (summary.final_support.lower, summary.final_support.upper);
-            let mean = F64Interval::new(summary.final_mean.lower, summary.final_mean.upper)?
-                .intersect(F64Interval::new(support.0 as f64, support.1 as f64)?)
-                .ok_or_else(|| invalid("LUCK mean and support disagree"))?;
-            Ok(OrderScoreInterval {
-                order,
-                mean,
-                support,
-                exact_mean: summary.exact_constant_score.map(|s| fraction(s as i128)),
-                final_life: summary.exact_final_life.map(|life| (life, life)),
-                tails: BTreeMap::new(),
-                refined_payoff: None,
-            })
-        },
-        cancelled,
-    )
+    let performers = order.map(|slot| input.performers[slot].clone());
+    let summary = ournotes_sim::live::full::luck_score_summary_with_curves(
+        master,
+        skills,
+        &performers,
+        &input.notes,
+        &input.events,
+        input.params,
+        setup,
+        &input.play,
+        &input.delta_times,
+        input.rank_confirmations.as_deref(),
+        curves,
+    )?;
+    let support = (summary.final_support.lower, summary.final_support.upper);
+    let mean = F64Interval::new(summary.final_mean.lower, summary.final_mean.upper)?
+        .intersect(F64Interval::new(support.0 as f64, support.1 as f64)?)
+        .ok_or_else(|| invalid("LUCK mean and support disagree"))?;
+    Ok(OrderScoreInterval {
+        order,
+        mean,
+        support,
+        exact_mean: summary.exact_constant_score.map(|s| fraction(s as i128)),
+        final_life: summary.exact_final_life.map(|life| (life, life)),
+        tails: BTreeMap::new(),
+        refined_payoff: None,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn evaluate_luck_context_parallel(
+    master: &ournotes_sim::master::Master,
+    skills: &ournotes_sim::live::full::LuckSkills,
+    input: &super::expectation::FiniteSeedContext,
+    map: &PayoffMap,
+    caches: &mut [ournotes_sim::live::full::LuckDpCache],
+) -> Result<Option<CertifiedEvaluation>, Error> {
+    let orders = uniform::all_orders();
+    let result = crate::native_jobs::map(caches, &orders, crate::parallel::cancellation_check(), |cache, order| {
+        luck_order(master, skills, input, *order, Some(cache))
+    })?;
+    result.map(|orders| aggregate_orders(orders, map)).transpose()
 }
 
 #[cfg(test)]
