@@ -310,6 +310,9 @@ pub struct Incumbents {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarmStart {
+    /// Heuristic pilot orders; deferred proposals remain in the complete search domain.
+    pub pilot_orders: u64,
+    pub deferred_proposals: u64,
     /// Exact evaluations of the warm start, and leaf-bound evaluations of its local search and of polishing.
     pub evaluations: u64,
     pub leaf_bound_checks: u64,
