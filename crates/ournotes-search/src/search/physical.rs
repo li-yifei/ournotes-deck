@@ -1134,7 +1134,14 @@ pub(crate) fn solve_physical_impl(
                 #[cfg(not(target_arch = "wasm32"))]
                 let mut luck_screen = luck_seed::Screen::default();
                 #[cfg(not(target_arch = "wasm32"))]
-                if matches!(strategy, Strategy::BranchAndBound) && engine.certified.is_some() && !engine.expired() {
+                // Compiled bounds use the upstream warm start. LUCK proposals cover the
+                // exhaustive fallback, where traversal otherwise begins in card-ID order.
+                if matches!(strategy, Strategy::BranchAndBound)
+                    && plan.joint.is_none()
+                    && plan.deck_payoff.is_none()
+                    && engine.certified.is_some()
+                    && !engine.expired()
+                {
                     engine.rec.begin(&mut engine.tel, "luckWarmStart", None);
                     luck_seed::seed(&plan.domain, &mut engine, &mut luck_screen)?;
                     engine.rec.end(&mut engine.tel);
