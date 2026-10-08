@@ -18,11 +18,11 @@ mod clock;
 pub mod domain;
 pub mod engine;
 pub mod handler;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_jobs;
 pub mod owned_snapshot;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod parallel;
-#[cfg(not(target_arch = "wasm32"))]
-mod native_jobs;
 pub mod recommendation;
 pub mod search;
 pub mod skip_event;

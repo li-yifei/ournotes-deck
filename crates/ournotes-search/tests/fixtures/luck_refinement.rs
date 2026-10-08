@@ -11,19 +11,40 @@ use ournotes_sim::{cards::Roster, data::DeckData};
 use serde_json::json;
 
 fn inputs(threshold: i32, k: usize, cache_entries: usize) -> (DeckData, Roster, RecommendationRequest) {
+    inputs_with_missions(threshold, k, cache_entries, [2, 3, 1])
+}
+
+fn inputs_with_missions(
+    threshold: i32,
+    k: usize,
+    cache_entries: usize,
+    missions: [i32; 3],
+) -> (DeckData, Roster, RecommendationRequest) {
     let mut synth = synthetic_master(5, 2, 5);
     set_column(&mut synth, "MasterLiveMusic", &mut |row| {
-        row["_gekisouMission1"] = json!(2);
-        row["_gekisouMission2"] = json!(3);
-        row["_gekisouMission3"] = json!(1);
+        row["_gekisouMission1"] = json!(missions[0]);
+        row["_gekisouMission2"] = json!(missions[1]);
+        row["_gekisouMission3"] = json!(missions[2]);
     });
     set_column(&mut synth, "MasterLiveSettings", &mut |row| {
         if matches!(row["_key"].as_str(), Some("gekisou_luck_gauge_max" | "gekisou_luck_gauge_max_rush")) {
             row["_value"] = json!("10");
         }
     });
+    if missions == [2, 2, 2] {
+        set_column(&mut synth, "MasterLiveMusicScore", &mut |row| row["_fullComboCount"] = json!(60));
+    }
     let mut document = data_document(&synth, 5, 2, 5);
-    document["charts"][0]["fevers"] = json!({"startMs":[150],"endMs":[400]});
+    if missions == [2, 2, 2] {
+        // Leave time for each range's END/DELAY/COMPLETE/FINISH lifecycle.
+        document["charts"][0]["notes"] = json!({"id":(1..=60).collect::<Vec<_>>(),"op":vec![1;60],
+            "judgementType":vec![1;60],"timeMs":(1..=60).map(|i|i*1000).collect::<Vec<_>>()});
+    }
+    document["charts"][0]["fevers"] = if missions == [2, 2, 2] {
+        json!({"startMs":[1000, 21000, 41000],"endMs":[3000, 23000, 43000]})
+    } else {
+        json!({"startMs":[150],"endMs":[400]})
+    };
     let data = DeckData::from_json(&document.to_string()).unwrap();
     let roster = Roster::from_json(&roster_document(5, 2, 5).to_string()).unwrap();
     let mut request = joint_request("mission", true, json!({"kind":"scoreAtLeast","threshold":threshold}));
@@ -214,13 +235,13 @@ fn native_luck_orders_and_refinement_match_serial_proof() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn luck_fallback_warmup_preserves_exhaustive_result() {
+fn luck_compiled_bounds_preserve_exhaustive_result_without_native_warmup() {
     use ournotes_search::parallel::{self, Cancellation};
     let (mut data, roster, mut request) = inputs(545_749, 5, 64);
     for skill in &mut data.master.gekisou_skills {
         skill.gekisou_mission_type = 2;
     }
-    // Damage reduction is simulated but deliberately refused by the live upper-bound compiler.
+    // Upstream now certifies damage reduction; native warmup must leave that route to upstream.
     data.master.gekisou_skill_effects[0].skill_effect_type = 3004;
     request.limits.time_limit_ms = None;
     let reference = engine::recommend(&data, &roster, &request).unwrap();
@@ -230,8 +251,8 @@ fn luck_fallback_warmup_preserves_exhaustive_result() {
     assert_eq!(actual.completion, reference.completion);
     assert_eq!(actual.results, reference.results);
     assert_eq!(actual.optimality, reference.optimality);
-    assert!(actual.telemetry.incumbents.warm_start.evaluations > 0);
-    assert!(actual.telemetry.incumbents.warm_start.pilot_orders >= 10);
+    assert!(actual.telemetry.environment.bounds.compiled);
+    assert_eq!(actual.telemetry.incumbents.warm_start.pilot_orders, 0);
 }
 
 #[cfg(not(target_arch = "wasm32"))]

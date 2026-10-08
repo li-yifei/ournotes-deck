@@ -136,10 +136,10 @@ use leaf_search::*;
 use rows::*;
 pub(crate) use rush::RushMasks;
 use score_windows::*;
-use setup::*;
-pub(crate) use setup::{FullSetup, deck_performers};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use setup::performer;
+use setup::*;
+pub(crate) use setup::{FullSetup, deck_performers};
 pub(crate) use snap_live::SnapLive;
 use snap_live::*;
 

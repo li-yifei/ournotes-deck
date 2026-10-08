@@ -18,6 +18,9 @@ const FIXTURE_SEED: u64 = 20_261_001;
 const SCORE_ID: i64 = 1004;
 const EVENT_ID: i64 = 7;
 
+#[path = "fixtures/carrier_cache.rs"]
+#[cfg(feature = "search-diagnostics")]
+mod carrier_cache;
 #[path = "fixtures/combo_integer.rs"]
 mod combo_integer;
 #[path = "fixtures/conversion_partitions.rs"]
@@ -40,9 +43,6 @@ mod scenario_completion;
 mod score_paths;
 #[path = "fixtures/sustained_combo.rs"]
 mod sustained_combo;
-#[path = "fixtures/carrier_cache.rs"]
-#[cfg(feature = "search-diagnostics")]
-mod carrier_cache;
 
 fn joint_request(mode: &str, gekisou: bool, metric: Value) -> ournotes_search::types::RecommendationRequest {
     serde_json::from_value(joint_request_json(mode, gekisou, metric)).unwrap()
