@@ -916,3 +916,138 @@ fn interrupted_prefix_recording_retains_only_finished_order_programs() {
         assert_eq!(recorded.program.evaluate(live.params.total_power), native.score());
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn grouped_play_matches_every_order_and_records_programs_at_any_depth() {
+    let master = master_from(&tables());
+    for (gekisou, seed) in [(false, 7), (true, 9)] {
+        let live = live(gekisou);
+        let orders = all_orders(5);
+        let (alone, exact) = alone(&live, &master, &orders, seed);
+        let serial = live.simulate_orders(&master, &orders, LiveRandom::new(seed), |_, _| Ok(())).unwrap();
+        for (threads, depth) in [(1, 1), (2, 1), (3, 2), (8, 2), (16, 3), (4, 5)] {
+            let (outcome, results, records) = live
+                .simulate_orders_grouped(
+                    &master,
+                    &orders,
+                    LiveRandom::new(seed),
+                    64 * 1024 * 1024,
+                    threads,
+                    depth,
+                    None,
+                    30,
+                    &|| false,
+                    &|_, m| Ok(i128::from(m.score())),
+                )
+                .unwrap();
+            assert!(matches!(outcome, OrdersOutcome::Complete(_)), "{threads} threads depth {depth}");
+            let s = sharing(&outcome);
+            assert!(s.frames >= serial.frames && s.frames <= s.separate_frames, "{s:?} vs {serial:?}");
+            for (i, r) in results.iter().enumerate() {
+                let r = r.expect("every order played");
+                assert_eq!((r.index, r.score, r.final_life, r.payoff), (i, alone[i].score, alone[i].life, exact[i]));
+            }
+            let records = records.expect("complete recording");
+            assert_eq!(records.len(), orders.len());
+            let mut seen: Vec<usize> = records.iter().map(|r| r.index).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..orders.len()).collect::<Vec<_>>());
+            for record in &records {
+                assert_eq!(record.program.evaluate(live.params.total_power), alone[record.index].score);
+                assert_eq!(record.final_life, alone[record.index].life);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn grouped_play_stops_below_the_threshold_and_interrupts_on_cancellation() {
+    let master = master_from(&tables());
+    let live = live(true);
+    let orders = all_orders(5);
+    let (alone, exact) = alone(&live, &master, &orders, 3);
+    let total: i128 = exact.iter().sum();
+    let caps: Vec<i128> = exact.iter().map(|p| p + 2).collect();
+    let root: i128 = caps.iter().sum();
+    let payoff = |_: usize, m: &LiveModel| Ok(i128::from(m.score()));
+    // With one order left its cap exceeds its payoff by 2, so the remaining-sum check
+    // can stop exactly when the threshold exceeds `total + 2`.
+    for stop_below in [i128::MIN, total, total + 2, total + 3, root, root + 1] {
+        let (result, results, records) = live
+            .simulate_orders_grouped(
+                &master,
+                &orders,
+                LiveRandom::new(3),
+                64 * 1024 * 1024,
+                4,
+                2,
+                Some((stop_below, &caps)),
+                10,
+                &|| false,
+                &payoff,
+            )
+            .unwrap();
+        let visited: Vec<Option<Outcome>> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r.map(|_| outcome(&live.simulate(&master, &orders[i], LiveRandom::new(3)).unwrap())))
+            .collect();
+        let done = check_visited(&visited, &alone, &orders);
+        for r in results.iter().flatten() {
+            assert_eq!(r.payoff, exact[r.index]);
+        }
+        match result {
+            OrdersOutcome::Complete(_) => {
+                assert!(stop_below <= total + 2, "{stop_below} {total}");
+                assert_eq!(done, orders.len());
+                assert_eq!(records.map(|r| r.len()), Some(orders.len()));
+            }
+            OrdersOutcome::Stopped(_) => {
+                assert!(stop_below > total + 2, "{stop_below} {total}");
+                assert!(done < orders.len());
+                // The orders done plus the caps of the rest prove the sum below the threshold.
+                let proven: i128 = results.iter().enumerate().map(|(i, r)| r.map_or(caps[i], |r| r.payoff)).sum();
+                assert!(proven < stop_below);
+                if stop_below > root {
+                    assert_eq!(done, 0);
+                }
+            }
+            OrdersOutcome::Interrupted(_) => panic!("nothing interrupts"),
+        }
+    }
+    let (outcome, results, records) = live
+        .simulate_orders_grouped(
+            &master,
+            &orders,
+            LiveRandom::new(3),
+            64 * 1024 * 1024,
+            4,
+            2,
+            Some((i128::MIN, &caps)),
+            10,
+            &|| true,
+            &payoff,
+        )
+        .unwrap();
+    assert!(matches!(outcome, OrdersOutcome::Interrupted(_)));
+    assert!(results.iter().all(Option::is_none));
+    assert!(records.is_none());
+    let low: Vec<i128> = exact.iter().map(|p| p - 1).collect();
+    assert!(
+        live.simulate_orders_grouped(
+            &master,
+            &orders,
+            LiveRandom::new(3),
+            0,
+            4,
+            2,
+            Some((i128::MIN, &low)),
+            10,
+            &|| false,
+            &payoff,
+        )
+        .is_err()
+    );
+}

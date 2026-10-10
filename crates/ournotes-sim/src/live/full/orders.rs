@@ -77,6 +77,17 @@ pub struct RecordedOrder {
     pub random_draws: u64,
 }
 
+/// One order's finished live from [`OrderedLive::simulate_orders_grouped`].
+#[derive(Clone, Copy, Debug)]
+pub struct GroupedOrder {
+    /// Index in the caller's order array.
+    pub index: usize,
+    pub score: i32,
+    pub final_life: i32,
+    pub draws: u64,
+    pub payoff: i128,
+}
+
 /// A set of orders that agree on the `fixed` positions, with a model that has played a common prefix for all of them.
 /// The model holds the members in the arrangement `assign` (position -> member) and no member of an open position has
 /// acted yet.
@@ -344,6 +355,183 @@ impl OrderedLive {
             ControlFlow::Break(Halt::Stopped) => OrdersOutcome::Stopped(driver.stats),
             ControlFlow::Break(Halt::Interrupted) => OrdersOutcome::Interrupted(driver.stats),
         })
+    }
+
+    /// Plays `orders` on up to `threads` threads. Orders that agree on their first `depth` positions form one
+    /// group; a group shares frames through the tree of [`OrderedLive::simulate_orders_bounded`], and groups replay
+    /// the frames they would have shared. Every order's result is that of [`OrderedLive::simulate`]; equal orders
+    /// in different groups are not merged. `payoff(i, model)` returns the payoff of `orders[i]`.
+    ///
+    /// `stop`: `(stop_below, caps)` with `caps[i]` an upper bound on the payoff of `orders[i]`. The play returns
+    /// [`OrdersOutcome::Stopped`] once the exact payoffs of the orders done plus the caps of the others fall below
+    /// `stop_below`; the orders not visited are given up. The bound is checked when a group splits and every
+    /// `check_every` frames, as in the serial tree, but without the tree's per-node refinement. `cancelled` ends the
+    /// play with [`OrdersOutcome::Interrupted`]. Programs record like
+    /// [`OrderedLive::simulate_orders_bounded_recorded_partial`]; `None` once all groups exceed `program_bytes`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn simulate_orders_grouped(
+        &self,
+        master: &Master,
+        orders: &[Vec<usize>],
+        random: LiveRandom,
+        program_bytes: usize,
+        threads: usize,
+        depth: usize,
+        stop: Option<(i128, &[i128])>,
+        check_every: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        payoff: &(dyn Fn(usize, &LiveModel) -> Result<i128, Error> + Sync),
+    ) -> Result<(OrdersOutcome, Vec<Option<GroupedOrder>>, Option<Vec<RecordedOrder>>), Error> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for o in orders {
+            self.check_order(o)?;
+        }
+        if let Some((_, caps)) = stop
+            && caps.len() != orders.len()
+        {
+            return Err(Error::Input("one payoff cap per order".into()));
+        }
+        let mut groups: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = Default::default();
+        for (i, o) in orders.iter().enumerate() {
+            groups.entry(o[..depth.min(o.len())].to_vec()).or_default().push(i);
+        }
+        let groups: Vec<Vec<usize>> = groups.into_values().collect();
+        let workers = threads.clamp(1, groups.len().max(1));
+        struct Remaining {
+            done: i128,
+            rest: i128,
+            left: usize,
+        }
+        let remaining = std::sync::Mutex::new(Remaining {
+            done: 0,
+            rest: stop.map_or(0, |(_, caps)| caps.iter().fold(0i128, |a, &c| a.saturating_add(c))),
+            left: orders.len(),
+        });
+        // The root check of the serial tree: give every order up before a frame plays.
+        if let Some((stop_below, _)) = stop
+            && !orders.is_empty()
+            && remaining.lock().unwrap_or_else(|e| e.into_inner()).rest < stop_below
+        {
+            let stats = OrderSharing { bound: Some(0), ..OrderSharing::default() };
+            return Ok((OrdersOutcome::Stopped(stats), vec![None; orders.len()], None));
+        }
+        let stopped = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let next = AtomicUsize::new(0);
+        let halted = || cancelled() || stopped.load(Ordering::Relaxed) || failed.load(Ordering::Relaxed);
+        type Part = (Vec<GroupedOrder>, ProgramCollector, OrderSharing, bool);
+        let work = || -> Result<Part, Error> {
+            let mut results = Vec::new();
+            let mut collector = ProgramCollector::new(program_bytes, orders.len());
+            let record = collector.rows.is_some();
+            let mut stats = OrderSharing::default();
+            let mut interrupted = false;
+            while !halted() {
+                let g = next.fetch_add(1, Ordering::Relaxed);
+                let Some(group) = groups.get(g) else { break };
+                let subset: Vec<Vec<usize>> = group.iter().map(|&i| orders[i].clone()).collect();
+                let mut visit = |local: usize, model: &LiveModel| -> Result<i128, Error> {
+                    let i = group[local];
+                    let value = payoff(i, model)?;
+                    results.push(GroupedOrder {
+                        index: i,
+                        score: model.score(),
+                        final_life: model.current_life(),
+                        draws: model.draws(),
+                        payoff: value,
+                    });
+                    collector.visit(i, model)?;
+                    if let Some((stop_below, caps)) = stop {
+                        let mut r = remaining.lock().unwrap_or_else(|e| e.into_inner());
+                        r.done = r.done.saturating_add(value);
+                        r.rest = r.rest.saturating_sub(caps[i]);
+                        r.left -= 1;
+                        // Like the serial tree, only an order left to give up makes this a stop.
+                        if r.left > 0 && r.done.saturating_add(r.rest) < stop_below {
+                            stopped.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(value)
+                };
+                let mut upper = |ids: &[usize], _: &LiveModel, _: Settled| -> Result<ControlFlow<(), i128>, Error> {
+                    if halted() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    Ok(ControlFlow::Continue(match stop {
+                        Some((_, caps)) => ids.iter().fold(0i128, |a, &l| a.saturating_add(caps[group[l]])),
+                        None => i128::MAX,
+                    }))
+                };
+                // The group's own threshold never triggers: the shared remaining-sum check above decides.
+                let bounds = Bounds { stop_below: i128::MIN, check_every, upper: &mut upper };
+                let outcome = match self.play_orders(master, &subset, random.clone(), record, Some(bounds), &mut visit)
+                {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        failed.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                };
+                let s = match outcome {
+                    OrdersOutcome::Complete(s) | OrdersOutcome::Stopped(s) => s,
+                    OrdersOutcome::Interrupted(s) => {
+                        interrupted = true;
+                        s
+                    }
+                };
+                stats.frames += s.frames;
+                stats.separate_frames += s.separate_frames;
+                stats.branches += s.branches;
+                stats.replayed += s.replayed;
+                stats.clones += s.clones;
+                stats.bounds += s.bounds;
+            }
+            Ok((results, collector, stats, interrupted))
+        };
+        let parts = std::thread::scope(|scope| {
+            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
+            let mut parts = vec![work()];
+            for h in handles {
+                parts.push(h.join().unwrap_or_else(|_| Err(Error::Domain("grouped order play panicked".into()))));
+            }
+            parts
+        });
+        let mut results = vec![None; orders.len()];
+        let mut rows = Vec::new();
+        let mut used = 0usize;
+        let mut stats = OrderSharing::default();
+        let mut interrupted = false;
+        let mut recorded = program_bytes > 0;
+        for part in parts {
+            let (done, collector, s, halt) = part?;
+            for r in done {
+                results[r.index] = Some(r);
+            }
+            match collector.rows {
+                Some(part_rows) if collector.collecting => {
+                    used = used.saturating_add(collector.used);
+                    rows.extend(part_rows);
+                }
+                _ => recorded = false,
+            }
+            stats.frames += s.frames;
+            stats.separate_frames += s.separate_frames;
+            stats.branches += s.branches;
+            stats.replayed += s.replayed;
+            stats.clones += s.clones;
+            stats.bounds += s.bounds;
+            interrupted |= halt;
+        }
+        let programs = (recorded && used <= program_bytes && !rows.is_empty()).then_some(rows);
+        let outcome = if stopped.load(Ordering::Relaxed) {
+            OrdersOutcome::Stopped(stats)
+        } else if interrupted || results.iter().any(Option::is_none) {
+            OrdersOutcome::Interrupted(stats)
+        } else {
+            OrdersOutcome::Complete(stats)
+        };
+        Ok((outcome, results, programs))
     }
 
     /// The positions whose chart skill events fire in frame `frame` of a model that has played the frames before it.

@@ -105,6 +105,15 @@ pub(crate) fn native_workers() -> usize {
 pub(crate) fn simulation_workers() -> usize {
     CONTROL.with(|v| v.borrow().as_ref().map_or(1, |c| c.simulation_workers))
 }
+/// Performance orders that agree on this many leading positions play as one
+/// shared-prefix group; more groups balance more threads at the cost of replayed
+/// shared frames.
+///
+/// Measured on a 920-note chart: five groups (depth 1) replay 4% of the shared
+/// frames, twenty groups (depth 2) 6%, sixty groups (depth 3) 37%.
+pub(crate) fn order_group_depth(workers: usize) -> usize {
+    if workers <= 2 { 1 } else { 2 }
+}
 pub(crate) fn cancellation_check() -> impl Fn() -> bool + Send + Sync {
     let control = CONTROL.with(|v| v.borrow().clone());
     move || {
@@ -212,9 +221,11 @@ pub(crate) fn publish(deck: RecommendedDeck) -> Result<(), Error> {
     })
 }
 
-/// Half of the logical CPUs available to this process, rounded upward.
+/// Every logical CPU available to this process. Apple silicon efficiency cores
+/// still add throughput: on 5P+10E, fifteen LUCK simulation threads evaluated
+/// 50% more candidates per budget than eight.
 pub fn default_workers() -> usize {
-    max_workers().div_ceil(2)
+    max_workers()
 }
 
 /// Logical CPUs available to the current process.
@@ -293,6 +304,17 @@ pub(crate) fn recommend_started(
     } else {
         None
     };
+    // Ordinary Live branch-and-bound keeps one serial traversal (its warm start and
+    // bounds prune best with a single frontier) and plays each team's performance
+    // orders in parallel. Partitioned domains repeat warm starts and evaluate
+    // teams the serial frontier would have pruned.
+    let grouped_live = workers > 1
+        && fallback.is_none()
+        && matches!(request.execution, Execution::Live { .. })
+        && matches!(request.strategy, Strategy::BranchAndBound);
+    if grouped_live {
+        fallback = Some("live traversal serial; performance orders simulated in parallel");
+    }
     // Validate the original request, including all initial decks, before any split.
     let partitioning = workers > 1 && fallback.is_none() && !cancellation.is_cancelled();
     let built = if partitioning {
@@ -314,30 +336,22 @@ pub(crate) fn recommend_started(
     let tasks = if workers == 1 || fallback.is_some() || cancellation.is_cancelled() {
         vec![request.clone()]
     } else {
-        // Live branch-and-bound recompiles expensive domain-specific envelopes
-        // per task. Two tasks per worker amortize that cost; exhaustive search
-        // keeps finer balancing because it has no bound compilation.
-        let factor = if matches!(request.execution, Execution::Live { .. })
-            && matches!(request.strategy, Strategy::BranchAndBound)
-        {
-            2
-        } else {
-            4
-        };
-        partitions(&built, request, workers.saturating_mul(factor))?
+        // Four parts per worker: Power/Skip and exhaustive Live compile cheap or
+        // no per-part bounds, so finer parts mostly buy balance.
+        partitions(&built, request, workers.saturating_mul(4))?
     };
     if workers == 1 || tasks.len() <= 1 || fallback.is_some() || cancellation.is_cancelled() {
         // A single feasible part still uses the ordinary serial bound plan.
         let built = if partitioning { build_card_pool(data, roster, request)? } else { built };
         let mut control = Control::new(request, cancellation.clone(), false, start);
-        if certified {
+        if certified || grouped_live {
             control.simulation_workers = workers;
         }
         let mut out = controlled(Arc::new(control), || {
             crate::search::dispatch::execute(&built, None, start, start.elapsed().as_secs_f64() * 1000.0, progress)
         })?;
         out.telemetry.parallel = Some(Box::new(ParallelTelemetry {
-            simulation_worker_limit: if certified { workers } else { 1 },
+            simulation_worker_limit: if certified || grouped_live { workers } else { 1 },
             workers,
             workers_used: 1,
             tasks: 1,
@@ -518,6 +532,33 @@ fn compare(a: &RecommendedDeck, b: &RecommendedDeck) -> Result<std::cmp::Orderin
         .then_with(|| a.snaps.cmp(&b.snaps)))
 }
 
+/// Rough work estimate of a request's member domain, for balancing parts only.
+/// Teams are weighted by the card power of their free members, so parts that
+/// still contain the strong cards (where bounds prune least) count as larger.
+fn domain_size(pool: &ournotes_sim::pool::Pool, request: &RecommendationRequest) -> Result<f64, Error> {
+    let d = crate::domain::CandidateDomain::build(pool, &request.constraints)?;
+    if !d.is_feasible() {
+        return Ok(0.0);
+    }
+    // Measured on a 56-card roster and a 920-note chart: exponent 6 halved the
+    // longest part against the unweighted count; 12 overweighted the top card.
+    let alpha = 6.0;
+    let peak = d.members().iter().map(|&m| pool.members[m].power.total()).max().unwrap_or(1).max(1) as f64;
+    let weight = |m: usize| (pool.members[m].power.total().max(0) as f64 / peak).powf(alpha);
+    let slots = 5usize.saturating_sub(d.required().len());
+    // Elementary symmetric polynomial of degree `slots` over the free weights.
+    let mut e = vec![0.0f64; slots + 1];
+    e[0] = 1.0;
+    for &m in d.members().iter().filter(|m| !d.required().contains(m)) {
+        let w = weight(m);
+        for k in (1..=slots).rev() {
+            e[k] += e[k - 1] * w;
+        }
+    }
+    let fixed: f64 = d.required().iter().map(|&m| weight(m)).product();
+    Ok((e[slots] * fixed).max(f64::MIN_POSITIVE))
+}
+
 fn partitions(
     built: &crate::handler::BuiltProblem<'_>,
     request: &RecommendationRequest,
@@ -531,7 +572,7 @@ fn partitions(
     // Keep all legal leaders of a member composition in the same task. The
     // worker's exact score-law cache can then reuse the 120 performance orders.
     // Complementary membership constraints cover the original domain exactly.
-    let mut tasks = if matches!(request.execution, Execution::Live { .. }) {
+    let tasks = if matches!(request.execution, Execution::Live { .. }) {
         vec![request.clone()]
     } else {
         // Power/Skip profit from leader-specific bounds and have no 120-order
@@ -547,32 +588,55 @@ fn partitions(
         }
         tasks
     };
-    let mut i = 0;
-    while tasks.len() < target && i < tasks.len() {
-        let r = &tasks[i];
-        let d = crate::domain::CandidateDomain::build(pool, &r.constraints)?;
-        if let Some(&member) = d.members().iter().find(|m| !d.required().contains(m)) {
-            let id = pool.members[member].id;
-            let mut yes = r.clone();
-            yes.constraints.include_members.push(id);
-            let mut no = r.clone();
-            no.constraints.exclude_members.push(id);
-            let yes_ok = crate::domain::CandidateDomain::build(pool, &yes.constraints)?.is_feasible();
-            let no_ok = crate::domain::CandidateDomain::build(pool, &no.constraints)?.is_feasible();
-            tasks.remove(i);
-            if yes_ok {
-                tasks.insert(i, yes);
-            }
-            if no_ok {
-                tasks.push(no);
-            }
-            if !yes_ok {
-                continue;
-            }
-        } else {
-            i += 1;
+    // Split the largest estimated part first. Peeling one member at a time from
+    // a single chain left one near-complete complement holding most of the
+    // search; balanced parts also let the atomic task index start big work early.
+    let mut sized: Vec<(f64, bool, RecommendationRequest)> = Vec::with_capacity(target);
+    for r in tasks {
+        let size = domain_size(pool, &r)?;
+        sized.push((size, true, r));
+    }
+    while sized.len() < target {
+        let Some(i) = (0..sized.len()).filter(|&i| sized[i].1).max_by(|&a, &b| sized[a].0.total_cmp(&sized[b].0))
+        else {
+            break;
+        };
+        let d = crate::domain::CandidateDomain::build(pool, &sized[i].2.constraints)?;
+        // Split on the strongest free card. Requiring a strong card keeps the
+        // likely incumbents inside bounded parts; the complement that excludes
+        // every split card is then cheap to prune once the global cutoff fills.
+        let Some(&member) = d
+            .members()
+            .iter()
+            .filter(|m| !d.required().contains(m))
+            .max_by_key(|&&m| (pool.members[m].power.total(), std::cmp::Reverse(m)))
+        else {
+            sized[i].1 = false;
+            continue;
+        };
+        let id = pool.members[member].id;
+        let mut yes = sized[i].2.clone();
+        yes.constraints.include_members.push(id);
+        let mut no = sized[i].2.clone();
+        no.constraints.exclude_members.push(id);
+        let yes_size = domain_size(pool, &yes)?;
+        let no_size = domain_size(pool, &no)?;
+        let yes_ok = crate::domain::CandidateDomain::build(pool, &yes.constraints)?.is_feasible();
+        let no_ok = crate::domain::CandidateDomain::build(pool, &no.constraints)?.is_feasible();
+        sized.remove(i);
+        if yes_ok {
+            sized.push((yes_size, true, yes));
+        }
+        if no_ok {
+            sized.push((no_size, true, no));
+        }
+        if !yes_ok && !no_ok {
+            break;
         }
     }
+    // Largest first: the dynamic index then finishes small parts around the big ones.
+    sized.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut tasks: Vec<_> = sized.into_iter().map(|(_, _, r)| r).collect();
     for r in &mut tasks {
         let required: HashSet<_> = r.constraints.include_members.iter().copied().chain(r.constraints.leader).collect();
         r.initial_decks.retain(|d| {

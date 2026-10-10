@@ -275,11 +275,22 @@ fn native_deterministic_gekisou_partitions_match_exhaustive() {
         assert_eq!(result.completion, Completion::Complete);
         assert_eq!(result.results, serial.results);
         let t = result.telemetry.parallel.unwrap();
-        assert!(t.fallback.is_none());
-        if n > 1 {
-            assert!(t.tasks > 1);
+        match strategy {
+            // Exhaustive Live splits the domain; each part simulates serially.
+            Strategy::Exhaustive => {
+                assert!(t.fallback.is_none());
+                if n > 1 {
+                    assert!(t.tasks > 1);
+                }
+                assert_eq!(t.simulation_worker_limit, 1, "no nested parallelism");
+            }
+            // Branch-and-bound keeps one traversal and plays each team's orders in parallel.
+            _ => {
+                assert!(t.fallback.is_some_and(|f| f.contains("orders simulated in parallel")));
+                assert_eq!(t.tasks, 1);
+                assert_eq!(t.simulation_worker_limit, n);
+            }
         }
-        assert_eq!(t.simulation_worker_limit, 1, "no nested parallelism");
     }
 }
 
