@@ -717,4 +717,23 @@ mod tests {
         assert!(error.contains("unsupported manifest format"));
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn windows_def_file_lists_exactly_the_exported_functions() {
+        let source = include_str!("lib.rs");
+        let mut exported: Vec<&str> = source
+            .split("extern \"C\" fn ")
+            .skip(1)
+            .filter_map(|rest| rest.split('(').next())
+            .filter(|name| name.starts_with("ournotes_"))
+            .collect();
+        exported.sort_unstable();
+        let mut listed: Vec<&str> = include_str!("../ournotes_ffi.def")
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("ournotes_"))
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(listed, exported);
+    }
 }
