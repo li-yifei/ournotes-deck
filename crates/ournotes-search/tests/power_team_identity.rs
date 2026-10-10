@@ -209,7 +209,10 @@ fn parallel_normal_live_matches_serial_with_snap_skills() {
                     .unwrap();
             assert_eq!(out.completion, Completion::Complete);
             assert_eq!(out.results, serial.results);
-            assert_eq!(out.telemetry.parallel.unwrap().tasks > 1, parallel::max_workers() > 1);
+            // Ordinary Live keeps one traversal and plays each team's orders in parallel.
+            let p = out.telemetry.parallel.unwrap();
+            assert_eq!(p.tasks, 1);
+            assert_eq!(p.simulation_worker_limit, 3.min(parallel::max_workers()));
         }
     }
 }
@@ -238,7 +241,7 @@ fn parallel_can_cancel_an_active_search_and_rejects_invalid_inputs() {
     assert!(
         parallel::recommend(&data, &roster, &req, 3.min(parallel::max_workers()), Cancellation::default()).is_err()
     );
-    assert_eq!(parallel::default_workers(), std::thread::available_parallelism().map_or(1, usize::from).div_ceil(2));
+    assert_eq!(parallel::default_workers(), std::thread::available_parallelism().map_or(1, usize::from));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -270,7 +273,7 @@ fn parallel_thread_parameter_range_defaults_and_native_dispatch() {
     let (data, roster) = fixture(6, &[0, 30]);
     let req = request(Metric::Power, 5, Constraints::default());
     let maximum = parallel::max_workers();
-    assert_eq!(parallel::default_workers(), maximum.div_ceil(2));
+    assert_eq!(parallel::default_workers(), maximum);
     let expected = recommend(&data, &roster, &req).unwrap();
     for threads in [1, maximum] {
         let actual = parallel::with_native_threads(threads, || recommend(&data, &roster, &req)).unwrap().unwrap();

@@ -8,7 +8,7 @@ worker's exact 120-order score-law cache. Power/Skip start with leader domains,
 then membership decisions, retaining their stronger leader-specific bounds.
 Fixed-leader requests also split through membership decisions. An atomic
 task index distributes work dynamically. The worker allowance defaults to
-`available_parallelism().div_ceil(2)` (logical CPUs visible to the process).
+`available_parallelism()` (every logical CPU visible to the process).
 Native transport admission serializes simultaneous requests around this shared
 allowance. An explicit worker count accepts `1..=available_parallelism()`;
 invalid counts return input errors. The serial `engine::recommend` remains available for oracle comparisons.
@@ -74,7 +74,7 @@ without changing canonical result/proof rules.
   and `ournotes_recommend_account_json_with_threads(path, account, request, uint32_t threads)`.
   Existing three-argument functions use the default. Free returned JSON using
   `ournotes_free_string`. `ournotes_search_threads_json()` returns
-  `{"min":1,"max":N,"default":ceil(N/2)}`.
+  `{"min":1,"max":N,"default":N}`.
 - HTTP: POST `/recommend` with `{"roster":{...},"request":{...},"threads":4}`.
   Omit `threads` to use the default; fractions, strings, zero and values above N
   return 422. GET `/health` includes the range/default in its `threads` field.
@@ -302,3 +302,63 @@ LUCK ranges remain subject to the underlying model's explicit refusal.
 The existing model reads Gekisou member and support skills. A dedicated
 three-LUCK skill-match warm-start heuristic is separate future work; this
 parallel change does not introduce heuristic card exclusions.
+
+
+## Ordinary Live: one traversal, grouped order play (2026-10-10)
+
+Measured with the local 56-card roster on the 920-note score 10007103 (free
+Live, K=5, branch-and-bound, 5 s budget). The serial solver proved the Top-K in
+722 ms after 14 leaves; 73% of that time was the 120-order simulation. The
+partitioned native path took 3,080 ms on 8 workers and 2,116 ms on 15: every
+part repeated its warm start and evaluated teams the single frontier would have
+pruned (52 to 100 leaves), and the chain partitioner left one complement part
+(excluding a few low-ID cards) holding nearly the whole search.
+
+Native ordinary Live branch-and-bound now keeps the serial traversal, warm
+start, bounds and caches and plays each team's performance orders in parallel.
+`OrderedLive::simulate_orders_grouped` groups orders that agree on their first
+positions, runs each group through the existing shared-prefix tree on its own
+thread, and replays only the frames groups would have shared. Per-order caps
+still bound the team: a shared remaining-sum check (exact payoffs done plus the
+caps of the orders left) replaces the per-node cutoff tables and stops the play
+with the same `Stopped` proof; cancellation and the deadline interrupt it.
+Programs record as before. Every order's result is that of a standalone
+simulation, so results equal the serial solver's exactly. The telemetry reports
+`fallback: "live traversal serial; performance orders simulated in parallel"`
+with `simulationWorkerLimit` equal to the worker count and one task.
+
+| Threads | Group depth | Elapsed ms | Replayed shared frames |
+| ---: | ---: | ---: | ---: |
+| 1 (serial) | - | 640 | - |
+| 2 | 1 | 470 | 4% |
+| 5 | 2 | 306 | 6% |
+| 8 | 2 | 277 | 6% |
+| 15 | 2 | 248 | 6% |
+| 15 | 3 | 269-330 | 37% |
+
+Identical result vectors throughout. Depth 2 (twenty groups) is used from three
+threads upward; depth 1 (five groups) below. The remaining 180 ms at 15 threads
+is composition traversal, bound compilation and the warm start's own bookkeeping.
+Exhaustive Live, Power and Skip keep disjoint-domain partitions.
+
+Partitioning itself now splits the largest estimated part first, choosing the
+strongest free card (by card power) as the split member, and dispatches parts
+in descending size. Part sizes weight teams by member power (exponent 6):
+requiring a strong card keeps likely incumbents inside bounded parts, and the
+complement excluding the split cards is pruned once the global cutoff fills.
+On the same request this alone reduced the partitioned path from 3,080 to
+about 1,050 ms on 8 workers before the grouped order play superseded it for
+branch-and-bound.
+
+The default allowance is now every logical CPU. On an Apple silicon 5P+10E
+machine the certified LUCK path evaluated about 50% more candidates in 5 s with
+fifteen simulation threads than with eight (33 versus 22 in one run; 25 versus
+22 in later paired runs), and within-batch utilization stayed above 95%; the
+efficiency cores add throughput despite roughly 1.5x slower per-order time.
+
+```sh
+cargo test --release -p ournotes-sim --test orders grouped
+cargo test --release -p ournotes-search --test power_team_identity parallel
+cargo test --release -p ournotes-search --test adapter_fixture_export native_
+cargo run --release -p ournotes-search --example parallel-search -- DATA ROSTER REQUEST 15
+```

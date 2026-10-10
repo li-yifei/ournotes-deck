@@ -96,7 +96,7 @@ pub use luck_shapes::{
     FORMATION, LOTTERY_CONDITIONS, LUCK_REPLAY_CONDITIONS, LuckCondition, LuckScoreShape, LuckShapeProbe, LuckSkillKey,
     LuckSkills, LuckSource, formation_targets, is_luck_chain, luck_holder, luck_skill_key, luck_skills,
 };
-pub use orders::{OrderSharing, OrderedLive, OrdersOutcome, RecordedOrder};
+pub use orders::{GroupedOrder, OrderSharing, OrderedLive, OrdersOutcome, RecordedOrder};
 mod raw_runtime;
 mod replay_rank;
 mod score_program;
