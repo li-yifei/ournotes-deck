@@ -278,93 +278,162 @@ impl Engine<'_, '_> {
         self.tel.caches.program_bytes = self.programs.allocated_bytes();
         self.tel.caches.program_recordings += u64::from(capture_budget > 0);
         let live = input.into_ordered();
-        let mut visit = |local: usize, model: &LiveModel| -> Result<i128, Error> {
-            let i = missing[local];
-            if model.draws() != 0 {
-                return Err(Error::Unsupported(
-                    "a skill or mission of this team draws a lottery; the uniform member-order target covers \
-                     lottery-free lives only"
-                        .into(),
-                ));
-            }
-            let final_score = model.score();
-            final_lives[i] = model.current_life();
-            let payoff = payoff_of(
-                pool,
-                request,
-                metric,
-                event_input,
-                physical,
-                final_score,
-                power,
-                Some(model.current_life()),
-            )?;
-            outcomes[i] = Some(SeedOutcome {
-                root_seed: 0,
-                weight: 1,
-                performance_order: performance_orders[i],
-                final_score,
-                terminal_payoff: payoff,
-            });
-            Ok(payoff)
-        };
         self.tel.leaves.started += 1;
         let recording_started = (capture_budget > 0).then(Instant::now);
         let (_, resume) = self.rec.clock.lap(slot::SIMULATION);
-        let (outcome, programs) = match (caps, kth) {
-            (Some(caps), Some((threshold, kth_power))) => {
-                // `below(total)` holds exactly when `total < stop_below`
-                let stop_below = (if power < kth_power { threshold.saturating_add(1) } else { threshold })
-                    .saturating_sub(cached_sum);
-                let mut tables: Vec<Option<Option<_>>> = (0..ORDERS).map(|_| None).collect();
-                let upper = |ids: &[usize], model: &LiveModel, s: Settled| {
-                    if self.expired() {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                    let Some((b, domain)) = fine.filter(|_| model.frames_played() > 0) else {
-                        return Ok(ControlFlow::Continue(
-                            ids.iter().fold(0i128, |a, &local| a.saturating_add(caps[missing[local]])),
-                        ));
-                    };
-                    let (_, resume) = self.rec.clock.lap(slot::CUTOFF_TABLE);
-                    let mut sum = 0i128;
-                    for &local in ids {
-                        let i = missing[local];
-                        let table = tables[i].get_or_insert_with(|| {
-                            let t = b.cutoff_table(
-                                domain,
-                                physical,
-                                i64::from(power),
-                                &self.positions[i],
-                                &mut self.bound_scratch,
-                            );
-                            self.tel.leaves.cutoff.tables += u64::from(t.is_some());
-                            self.tel.leaves.cutoff.unavailable += u64::from(t.is_none());
-                            t
-                        });
-                        let cap = table.as_ref().and_then(|t| t.payoff_cap(b, s)).map_or(caps[i], |c| c.min(caps[i]));
-                        sum = sum.saturating_add(cap);
-                    }
-                    self.rec.clock.lap(resume);
-                    Ok(ControlFlow::Continue(sum))
-                };
-                live.simulate_orders_bounded_recorded_partial(
-                    master,
-                    &orders,
-                    LiveRandom::new(0),
-                    capture_budget,
-                    stop_below,
-                    CUTOFF_EVERY,
-                    upper,
-                    &mut visit,
-                )?
+        let mut grouped: Option<(OrdersOutcome, Option<Vec<ournotes_sim::live::full::RecordedOrder>>)> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::parallel::simulation_workers() > 1 {
+            // Native: the orders play as prefix groups on several threads. The per-order caps still
+            // bound the team; a shared remaining-sum check replaces the per-node cutoff tables.
+            let workers = crate::parallel::simulation_workers();
+            let local_caps: Option<Vec<i128>> = caps.as_ref().map(|caps| missing.iter().map(|&i| caps[i]).collect());
+            let stop = match (local_caps.as_deref(), kth) {
+                (Some(caps), Some((threshold, kth_power))) => {
+                    // `below(total)` holds exactly when `total < stop_below`
+                    let stop_below = (if power < kth_power { threshold.saturating_add(1) } else { threshold })
+                        .saturating_sub(cached_sum);
+                    Some((stop_below, caps))
+                }
+                _ => None,
+            };
+            let cancelled = crate::parallel::cancellation_check();
+            let payoff = |_: usize, model: &LiveModel| -> Result<i128, Error> {
+                if model.draws() != 0 {
+                    return Err(Error::Unsupported(
+                        "a skill or mission of this team draws a lottery; the uniform member-order target covers \
+                         lottery-free lives only"
+                            .into(),
+                    ));
+                }
+                payoff_of(
+                    pool,
+                    request,
+                    metric,
+                    event_input,
+                    physical,
+                    model.score(),
+                    power,
+                    Some(model.current_life()),
+                )
+            };
+            let (outcome, results, programs) = live.simulate_orders_grouped(
+                master,
+                &orders,
+                LiveRandom::new(0),
+                capture_budget,
+                workers,
+                crate::parallel::order_group_depth(workers),
+                stop,
+                CUTOFF_EVERY,
+                &cancelled,
+                &payoff,
+            )?;
+            for r in results.into_iter().flatten() {
+                let i = missing[r.index];
+                final_lives[i] = r.final_life;
+                outcomes[i] = Some(SeedOutcome {
+                    root_seed: 0,
+                    weight: 1,
+                    performance_order: performance_orders[i],
+                    final_score: r.score,
+                    terminal_payoff: r.payoff,
+                });
             }
-            _ => {
-                let (shared, programs) =
-                    live.simulate_orders_recorded(master, &orders, LiveRandom::new(0), capture_budget, |i, m| {
-                        visit(i, m).map(|_| ())
-                    })?;
-                (OrdersOutcome::Complete(shared), programs)
+            if matches!(outcome, OrdersOutcome::Interrupted(_)) {
+                self.expired();
+            }
+            grouped = Some((outcome, programs));
+        }
+        let (outcome, programs) = if let Some(grouped) = grouped {
+            grouped
+        } else {
+            let mut visit = |local: usize, model: &LiveModel| -> Result<i128, Error> {
+                let i = missing[local];
+                if model.draws() != 0 {
+                    return Err(Error::Unsupported(
+                        "a skill or mission of this team draws a lottery; the uniform member-order target covers \
+                     lottery-free lives only"
+                            .into(),
+                    ));
+                }
+                let final_score = model.score();
+                final_lives[i] = model.current_life();
+                let payoff = payoff_of(
+                    pool,
+                    request,
+                    metric,
+                    event_input,
+                    physical,
+                    final_score,
+                    power,
+                    Some(model.current_life()),
+                )?;
+                outcomes[i] = Some(SeedOutcome {
+                    root_seed: 0,
+                    weight: 1,
+                    performance_order: performance_orders[i],
+                    final_score,
+                    terminal_payoff: payoff,
+                });
+                Ok(payoff)
+            };
+            match (caps, kth) {
+                (Some(caps), Some((threshold, kth_power))) => {
+                    // `below(total)` holds exactly when `total < stop_below`
+                    let stop_below = (if power < kth_power { threshold.saturating_add(1) } else { threshold })
+                        .saturating_sub(cached_sum);
+                    let mut tables: Vec<Option<Option<_>>> = (0..ORDERS).map(|_| None).collect();
+                    let upper = |ids: &[usize], model: &LiveModel, s: Settled| {
+                        if self.expired() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        let Some((b, domain)) = fine.filter(|_| model.frames_played() > 0) else {
+                            return Ok(ControlFlow::Continue(
+                                ids.iter().fold(0i128, |a, &local| a.saturating_add(caps[missing[local]])),
+                            ));
+                        };
+                        let (_, resume) = self.rec.clock.lap(slot::CUTOFF_TABLE);
+                        let mut sum = 0i128;
+                        for &local in ids {
+                            let i = missing[local];
+                            let table = tables[i].get_or_insert_with(|| {
+                                let t = b.cutoff_table(
+                                    domain,
+                                    physical,
+                                    i64::from(power),
+                                    &self.positions[i],
+                                    &mut self.bound_scratch,
+                                );
+                                self.tel.leaves.cutoff.tables += u64::from(t.is_some());
+                                self.tel.leaves.cutoff.unavailable += u64::from(t.is_none());
+                                t
+                            });
+                            let cap =
+                                table.as_ref().and_then(|t| t.payoff_cap(b, s)).map_or(caps[i], |c| c.min(caps[i]));
+                            sum = sum.saturating_add(cap);
+                        }
+                        self.rec.clock.lap(resume);
+                        Ok(ControlFlow::Continue(sum))
+                    };
+                    live.simulate_orders_bounded_recorded_partial(
+                        master,
+                        &orders,
+                        LiveRandom::new(0),
+                        capture_budget,
+                        stop_below,
+                        CUTOFF_EVERY,
+                        upper,
+                        &mut visit,
+                    )?
+                }
+                _ => {
+                    let (shared, programs) =
+                        live.simulate_orders_recorded(master, &orders, LiveRandom::new(0), capture_budget, |i, m| {
+                            visit(i, m).map(|_| ())
+                        })?;
+                    (OrdersOutcome::Complete(shared), programs)
+                }
             }
         };
         if let Some(started) = recording_started {
