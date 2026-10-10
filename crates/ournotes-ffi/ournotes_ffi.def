@@ -1,0 +1,20 @@
+; Export list for Windows DLLs linked through zig (cargo-zigbuild drops rustc's own
+; list.def, so lld would otherwise export every Rust symbol). Kept in sync by a test.
+LIBRARY ournotes_ffi
+EXPORTS
+    ournotes_account_job_cancel_json
+    ournotes_account_job_poll_json
+    ournotes_account_job_start_json
+    ournotes_capabilities_json
+    ournotes_dataset_info_json
+    ournotes_ffi_version
+    ournotes_free_string
+    ournotes_local_summary_json
+    ournotes_manifest_json
+    ournotes_recommend_account_json
+    ournotes_recommend_account_json_with_threads
+    ournotes_recommend_json
+    ournotes_recommend_json_with_threads
+    ournotes_recommend_manifest_json
+    ournotes_search_threads_json
+    ournotes_string_len
