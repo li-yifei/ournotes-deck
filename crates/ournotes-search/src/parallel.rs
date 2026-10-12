@@ -30,7 +30,9 @@ struct Control {
     k: usize,
     denominator: u128,
     top: Mutex<Vec<RecommendedDeck>>,
-    cutoff: RwLock<Option<(i128, i64)>>,
+    /// The K-th shared incumbent: its levels' expectation numerators (one entry for a metric without levels) and
+    /// power. Each worker folds the levels with its own partition's multipliers (`inferior`).
+    cutoff: RwLock<Option<(Vec<i128>, i64)>>,
     share: bool,
     deadline: Option<Instant>,
     simulation_workers: usize,
@@ -173,8 +175,10 @@ pub(crate) fn sharing() -> bool {
 }
 
 /// Only fully evaluated distinct teams publish a cutoff. Equal primary/power
-/// bounds stay open, preserving every canonical identity tie.
-pub(crate) fn inferior(upper: i128, power: i64) -> bool {
+/// bounds stay open, preserving every canonical identity tie. `upper` is in the
+/// worker's own payoff units: for a combined metric, the levels folded by
+/// `metric` (the worker's folded metric, whose multipliers depend on its part).
+pub(crate) fn inferior(upper: i128, power: i64, metric: &Metric) -> bool {
     CONTROL.with(|v| {
         let control = v.borrow();
         let Some(c) = control.as_ref() else { return false };
@@ -182,8 +186,48 @@ pub(crate) fn inferior(upper: i128, power: i64) -> bool {
             return false;
         }
         let cutoff = c.cutoff.read().unwrap_or_else(|p| p.into_inner());
-        cutoff.is_some_and(|threshold| (upper, power) < threshold)
+        let Some((levels, kth_power)) = cutoff.as_ref() else { return false };
+        fold_cutoff(metric, levels).is_some_and(|threshold| (upper, power) < (threshold, *kth_power))
     })
+}
+
+/// The K-th incumbent's levels as a cutoff in the folded units of `metric`.
+///
+/// Folding is order-preserving only for level sums within the caps of the
+/// worker's part, and an incumbent from another part may exceed them. The
+/// cutoff is therefore the folded value of the lexicographically largest
+/// in-cap level vector not above the incumbent's: any team of this part whose
+/// folded upper bound is below it is strictly below the incumbent's levels.
+/// None (no pruning) when the levels do not match the metric.
+fn fold_cutoff(metric: &Metric, levels: &[i128]) -> Option<i128> {
+    let Some(scales) = metric.levels() else {
+        return match levels {
+            [value] => Some(*value),
+            _ => None,
+        };
+    };
+    if scales.len() != levels.len() {
+        return None;
+    }
+    let unit = |at: usize| scales[at].scale.multiplier.max(1);
+    let mut folded = levels[0].checked_mul(unit(0))?;
+    // The largest folded sum the levels after `at - 1` may still contribute.
+    let mut budget = unit(0) - 1;
+    for at in 1..levels.len() {
+        let own = levels[at];
+        if own < 0 {
+            return None;
+        }
+        let digit = budget / unit(at);
+        if own > digit {
+            // Every in-cap vector below this budget is lexicographically smaller.
+            return folded.checked_add(budget);
+        }
+        let used = own.checked_mul(unit(at))?;
+        folded = folded.checked_add(used)?;
+        budget = (budget - used).min(unit(at) - 1);
+    }
+    Some(folded)
 }
 pub(crate) fn publish(deck: RecommendedDeck) -> Result<(), Error> {
     CONTROL.with(|v| {
@@ -208,10 +252,22 @@ pub(crate) fn publish(deck: RecommendedDeck) -> Result<(), Error> {
             top.truncate(c.k);
             if top.len() == c.k {
                 let last = top.last().unwrap();
-                let threshold = last.expected_payoff.as_ref().and_then(|f| {
-                    (f.denominator.parse::<u128>().ok()? == c.denominator)
-                        .then_some((f.numerator.parse::<i128>().ok()?, i64::from(last.power)))
-                });
+                let threshold = (|| {
+                    let numerators = |values: &[Fraction]| -> Option<Vec<i128>> {
+                        values
+                            .iter()
+                            .map(|f| {
+                                (f.denominator.parse::<u128>().ok()? == c.denominator)
+                                    .then(|| f.numerator.parse::<i128>().ok())?
+                            })
+                            .collect()
+                    };
+                    let levels = match &last.level_payoffs {
+                        Some(levels) => numerators(levels)?,
+                        None => numerators(std::slice::from_ref(last.expected_payoff.as_ref()?))?,
+                    };
+                    Some((levels, i64::from(last.power)))
+                })();
                 // Publish a consistent numeric pair once per incumbent update. Readers
                 // may see an older (weaker) cutoff, which only reduces pruning.
                 *c.cutoff.write().unwrap_or_else(|p| p.into_inner()) = threshold;
@@ -517,16 +573,37 @@ pub(crate) fn recommend_started(
     Ok(out)
 }
 
+/// The serial engines' ranking over wire results. A combined metric ranks by
+/// its folded payoff, which orders exactly as its levels' expectations compared
+/// lexicographically (`search/levels.rs`); the levels are compared directly
+/// because each part folds with multipliers of its own domain.
 fn compare(a: &RecommendedDeck, b: &RecommendedDeck) -> Result<std::cmp::Ordering, Error> {
-    let exact = |d: &RecommendedDeck| -> Result<crate::search::expectation::ExactExpectation, Error> {
-        let f =
-            d.expected_payoff.as_ref().ok_or_else(|| Error::Domain("parallel merge requires exact payoff".into()))?;
+    let exact = |f: &Fraction| -> Result<crate::search::expectation::ExactExpectation, Error> {
         Ok(crate::search::expectation::ExactExpectation {
             numerator: f.numerator.parse().map_err(|_| Error::Domain("invalid payoff numerator".into()))?,
             denominator: f.denominator.parse().map_err(|_| Error::Domain("invalid payoff denominator".into()))?,
         })
     };
-    Ok(crate::search::interval_topk::compare_exact(exact(b)?, exact(a)?)?
+    let levels = |d: &RecommendedDeck| -> Result<Vec<crate::search::expectation::ExactExpectation>, Error> {
+        match &d.level_payoffs {
+            Some(levels) => levels.iter().map(exact).collect(),
+            None => Ok(vec![exact(
+                d.expected_payoff.as_ref().ok_or_else(|| Error::Domain("parallel merge requires exact payoff".into()))?,
+            )?]),
+        }
+    };
+    let (a_levels, b_levels) = (levels(a)?, levels(b)?);
+    if a_levels.len() != b_levels.len() {
+        return Err(Error::Domain("parallel merge requires the same metric levels".into()));
+    }
+    let mut payoff = std::cmp::Ordering::Equal;
+    for (a, b) in a_levels.into_iter().zip(b_levels) {
+        payoff = crate::search::interval_topk::compare_exact(b, a)?;
+        if payoff.is_ne() {
+            break;
+        }
+    }
+    Ok(payoff
         .then_with(|| b.power.cmp(&a.power))
         .then_with(|| a.members.cmp(&b.members))
         .then_with(|| a.snaps.cmp(&b.snaps)))
@@ -649,4 +726,65 @@ fn partitions(
         tasks.push(request.clone());
     }
     Ok(tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn levels(count: usize, cap: i128) -> Metric {
+        let level = || MetricLevel::new(vec![MetricTerm { metric: Metric::Score, weight: 1 }]);
+        let metric = Metric::Combined { levels: (0..count).map(|_| level()).collect() };
+        crate::search::levels::fold(&metric, |_| cap).unwrap().unwrap()
+    }
+
+    #[test]
+    fn cutoffs_fold_with_the_worker_multipliers() {
+        let metric = levels(2, 7);
+        let unit = metric.levels().unwrap()[0].scale.multiplier;
+        assert_eq!(unit, 120 * 7 + 1);
+        assert_eq!(fold_cutoff(&metric, &[5, 300]), Some(5 * unit + 300));
+        // A first level below zero folds as the search's payoff does, not as its own numerator.
+        assert_eq!(fold_cutoff(&metric, &[-5, 10]), Some(-5 * unit + 10));
+        // Later levels above this part's caps clamp to the largest in-cap sum below them.
+        assert_eq!(fold_cutoff(&metric, &[5, 2000]), Some(5 * unit + unit - 1));
+        assert_eq!(fold_cutoff(&Metric::Score, &[42]), Some(42));
+        assert_eq!(fold_cutoff(&metric, &[42]), None);
+        assert_eq!(fold_cutoff(&metric, &[1, -1]), None);
+    }
+
+    #[test]
+    fn a_folded_bound_below_the_cutoff_is_below_the_incumbent_levels() {
+        let metric = levels(3, 2);
+        let scales = metric.levels().unwrap();
+        let unit: Vec<i128> = scales.iter().map(|level| level.scale.multiplier.max(1)).collect();
+        let fold = |c: [i128; 3]| c.iter().zip(&unit).map(|(c, u)| c * u).sum::<i128>();
+        // Every level vector a team of this part can reach, sampled over its in-cap range.
+        let reach = (unit[0] - 1) / unit[1];
+        let incumbents = [
+            [0, 0, 0],
+            [1, 3, 7],
+            [-2, reach, 240],
+            [1, reach + 1, 0],
+            [0, 3, 241],
+            [0, 3, 1000],
+            [2, 10_000, 10_000],
+        ];
+        for t in incumbents {
+            let cutoff = fold_cutoff(&metric, &t).unwrap();
+            for c0 in -3..=3 {
+                for c1 in (0..=reach).step_by(7).chain([reach]) {
+                    for c2 in (0..unit[1]).step_by(5).chain([unit[1] - 1]) {
+                        let c = [c0, c1, c2];
+                        if fold(c) < cutoff {
+                            assert!(c < t, "{c:?} pruned against {t:?}");
+                        }
+                        // Only the largest in-cap vector below a clamped incumbent may meet the cutoff
+                        // itself (then pruned by power alone): a cutoff one higher would prune teams above it.
+                        assert!(!(c < t && fold(c) > cutoff), "{c:?} below {t:?} stays open");
+                    }
+                }
+            }
+        }
+    }
 }

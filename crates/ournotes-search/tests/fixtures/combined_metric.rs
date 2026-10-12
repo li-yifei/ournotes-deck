@@ -511,3 +511,51 @@ fn account_combined_metric_contract_echoes_levels_and_rejects_incomplete_fields(
         assert!(answer.errors.iter().any(|issue| issue.path == path), "{path}: {:?}", answer.errors);
     }
 }
+
+/// Native parallel search ranks combined metrics as the serial engine does: partitioned domains (exhaustive and
+/// Skip branch-and-bound) share one folded-level cutoff across parts whose multipliers differ, and Live
+/// branch-and-bound keeps the serial traversal while its performance orders play on several threads.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn parallel_search_ranks_combined_metric_levels_as_the_serial_engine() {
+    use ournotes_search::parallel::{self, Cancellation};
+    let (data, roster) = inputs();
+    let workers = 4.min(parallel::max_workers()).max(2);
+    let cases: [&[&[(usize, u32)]]; 5] = [
+        &[&[(POINTS, 2), (CHALLENGE, 35)]],
+        &[&[(CHALLENGE, 1)], &[(POINTS, 1)]],
+        &[&[(CHALLENGE, 1)], &[(ITEMS, 1)], &[(POINTS, 1)]],
+        &[&[(AT_LEAST, 1)], &[(CHALLENGE, 1)], &[(ITEMS, 1)], &[(POINTS, 1)]],
+        &[&[(CHALLENGE, 2), (ITEMS, 2)], &[(AT_LEAST, 5), (CAPPED, 1)], &[(POINTS, 1), (SCORE, 1)]],
+    ];
+    let mut partitioned = 0;
+    for (mode, gekisou, skip) in MODES {
+        let (base, domain) = domain(&data, &roster, mode, gekisou, skip);
+        for levels in cases {
+            let expected = domain.ranked(levels);
+            for strategy in [Strategy::Exhaustive, Strategy::BranchAndBound] {
+                for k in [1, 3, 5] {
+                    let mut search = base.clone();
+                    search.metric = serde_json::from_value(domain.metric(levels)).unwrap();
+                    search.k = k;
+                    search.strategy = strategy.clone();
+                    let label = format!("{mode} skip={skip} {strategy:?} k={k} {levels:?}");
+                    let serial = engine::recommend(&data, &roster, &search).unwrap();
+                    let actual =
+                        parallel::recommend(&data, &roster, &search, workers, Cancellation::default()).unwrap();
+                    assert_eq!(actual.completion, Completion::Complete, "{label}");
+                    assert_eq!(actual.optimality, Optimality::Proven, "{label}");
+                    assert_eq!(actual.results, serial.results, "{label}");
+                    let teams: Vec<_> = actual.results.iter().map(|r| (r.members, r.snaps, r.power)).collect();
+                    let reference: Vec<_> = expected.iter().take(k).map(|(team, _)| *team).collect();
+                    assert_eq!(teams, reference, "{label}");
+                    let t = actual.telemetry.parallel.as_ref().expect("parallel telemetry");
+                    if t.fallback.is_none() && t.tasks > 1 {
+                        partitioned += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(partitioned > 0, "some combined requests ran on partitioned domains");
+}

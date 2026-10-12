@@ -163,7 +163,7 @@ fn visit(
     };
     let payoff = payoff * scale;
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::parallel::inferior(payoff, power) {
+    if crate::parallel::inferior(payoff, power, e.metric) {
         count.pruned += 1;
         return Ok(true);
     }

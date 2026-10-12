@@ -123,7 +123,7 @@ pub(super) fn traversal_of(d: &PhysicalDeck, converting: &[usize]) -> (usize, us
 /// Whether (payoff cap, power cap) is strictly inferior to a full Top-K's cutoff (the traversal's prune rule).
 pub(super) fn inferior(cap: (i128, i64), e: &Engine<'_, '_>) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::parallel::inferior(cap.0, cap.1) {
+    if crate::parallel::inferior(cap.0, cap.1, e.metric) {
         return true;
     }
     let Some((threshold, power)) = e.safe_cutoff() else { return false };

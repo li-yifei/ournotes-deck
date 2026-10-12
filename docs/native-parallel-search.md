@@ -362,3 +362,20 @@ cargo test --release -p ournotes-search --test power_team_identity parallel
 cargo test --release -p ournotes-search --test adapter_fixture_export native_
 cargo run --release -p ournotes-search --example parallel-search -- DATA ROSTER REQUEST 15
 ```
+
+## Combined metrics (upstream 0.0.6, 2026-10-12)
+
+A `combined` metric folds its levels into one integer per terminal result
+(`search/levels.rs`), but each partition folds with multipliers derived from its
+own domain's term caps, so folded values are not comparable across parts. The
+coordinator therefore merges wire results by their `levelPayoffs` compared
+lexicographically as exact fractions, which orders exactly as the serial folded
+payoff does, then by power and canonical IDs. The shared cutoff stores the K-th
+incumbent's level numerators; each worker folds them with its own multipliers,
+clamping later levels that exceed its caps to the largest in-cap vector below
+them, so a folded bound under the cutoff is always strictly below the
+incumbent's levels. Ordinary Live branch-and-bound keeps the serial traversal
+and plays orders in parallel through the same folded `payoff_of`. Combined
+metrics refuse certified LUCK lotteries upstream, so the certified frontier path
+never sees them. `parallel_search_ranks_combined_metric_levels_as_the_serial_engine`
+checks parallel against serial results for one to four levels.

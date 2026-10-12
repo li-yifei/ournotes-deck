@@ -82,7 +82,7 @@ fn least_identity(p: &PhysicalDeck, depth: usize, e: &Engine<'_, '_>) -> ([i64; 
 
 fn inferior(cap: i128, power: i64, p: Option<(&PhysicalDeck, usize)>, e: &Engine<'_, '_>) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::parallel::inferior(cap, power) {
+    if crate::parallel::inferior(cap, power, e.metric) {
         return true;
     }
     let Some((threshold, kth_power)) = e.safe_cutoff() else { return false };

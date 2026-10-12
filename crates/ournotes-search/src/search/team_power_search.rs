@@ -50,7 +50,7 @@ fn visit(
         return Ok(true);
     };
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::parallel::inferior(bounds.primary_upper(power, e.metric)?, power) {
+    if crate::parallel::inferior(bounds.primary_upper(power, e.metric)?, power, e.metric) {
         count.pruned += 1;
         return Ok(true);
     }
