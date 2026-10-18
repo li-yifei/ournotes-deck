@@ -4,7 +4,7 @@
 //! its own native OS thread. This makes concurrent searches independent while
 //! avoiding a reload of the usually large deck-data file.
 
-use ournotes_search::parallel;
+use ournotes_search::engine;
 use ournotes_sim::data::DeckData;
 use serde_json::{Value, json};
 use std::{
@@ -67,25 +67,26 @@ fn handle(mut stream: TcpStream, data: Arc<DeckData>) {
     let out = match (method, path) {
         ("GET", "/health") => (
             "200 OK",
-            json!({"ok":true,"threads":{"min":1,"max":parallel::max_workers(),"default":parallel::default_workers()}})
+            json!({"ok":true,"threads":{"min":1,"max":1,"default":1}})
                 .to_string(),
         ),
         ("POST", "/recommend") => match serde_json::from_slice::<Value>(body) {
             Ok(input) => {
                 let roster = input.get("roster").map(Value::to_string);
                 let request = input.get("request").map(Value::to_string);
+                // The search runs on one thread; a thread count is accepted for older callers.
                 let threads = match input.get("threads") {
-                    None => Ok(parallel::default_workers()),
+                    None => Ok(1),
                     Some(value) => value
                         .as_u64()
-                        .and_then(|v| usize::try_from(v).ok())
-                        .ok_or_else(|| "threads must be a positive integer".to_string())
-                        .and_then(|n| parallel::validate_workers(n).map(|()| n).map_err(|e| e.to_string())),
+                        .filter(|&v| v >= 1)
+                        .map(|_| 1usize)
+                        .ok_or_else(|| "threads must be a positive integer".to_string()),
                 };
                 match (roster, request, threads) {
                     (_, _, Err(error)) => ("422 Unprocessable Entity", json!({"error":error}).to_string()),
-                    (Some(roster), Some(request), Ok(threads)) => {
-                        match parallel::recommend_json_with_threads(&data, &roster, &request, threads) {
+                    (Some(roster), Some(request), Ok(_)) => {
+                        match engine::recommend_json(&data, &roster, &request) {
                             Ok(result) => ("200 OK", result),
                             Err(error) => ("422 Unprocessable Entity", json!({"error":error.to_string()}).to_string()),
                         }
