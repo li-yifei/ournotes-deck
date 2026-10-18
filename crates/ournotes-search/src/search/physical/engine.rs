@@ -92,7 +92,7 @@ impl Engine<'_, '_> {
         if self.stop.is_some() {
             return true;
         }
-        if self.budget.deadline().is_none() && self.progress.is_none() {
+        if self.budget.deadline().is_none() && self.progress.is_none() && !crate::cancel::requested() {
             return false;
         }
         // One clock read serves the deadline and the progress reports.

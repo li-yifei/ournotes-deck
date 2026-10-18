@@ -30,12 +30,12 @@ impl SearchBudget {
     }
 
     pub(crate) fn expired(self) -> bool {
-        self.deadline.is_some_and(|deadline| now() >= deadline)
+        crate::cancel::requested() || self.deadline.is_some_and(|deadline| now() >= deadline)
     }
 
     /// `expired` at a clock value the caller has just read with [`now`].
     pub(crate) fn expired_at(self, now: Instant) -> bool {
-        self.deadline.is_some_and(|deadline| now >= deadline)
+        crate::cancel::requested() || self.deadline.is_some_and(|deadline| now >= deadline)
     }
 }
 
