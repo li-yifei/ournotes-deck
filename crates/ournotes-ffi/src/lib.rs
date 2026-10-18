@@ -48,8 +48,10 @@ mod parallel {
 /// Updated with each rebase onto upstream.
 const UPSTREAM_COMMIT: &str = include_str!("../UPSTREAM_COMMIT");
 
-/// Admit one CPU search request, which owns a configurable number of internal
-/// search workers. Concurrent desktop requests wait for this allowance.
+/// Admits a bounded number of concurrent CPU search requests. Each search runs
+/// on a single thread, so the default is one request per available core;
+/// `OURNOTES_FFI_CONCURRENCY` (a positive integer) overrides it. Requests
+/// beyond the limit wait for a permit.
 struct SearchPool {
     slots: Mutex<usize>,
     wake: Condvar,
@@ -57,8 +59,17 @@ struct SearchPool {
 
 impl SearchPool {
     fn new() -> Self {
-        // One admitted request owns the native half-core worker allowance.
-        Self { slots: Mutex::new(1), wake: Condvar::new() }
+        let default = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let slots = std::env::var("OURNOTES_FFI_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default);
+        Self::with_slots(slots)
+    }
+
+    fn with_slots(slots: usize) -> Self {
+        Self { slots: Mutex::new(slots.max(1)), wake: Condvar::new() }
     }
 
     fn acquire_cancellable(&self, cancel: &parallel::Cancellation) -> Option<SearchPermit<'_>> {
@@ -261,8 +272,7 @@ pub unsafe extern "C" fn ournotes_recommend_json_with_threads(
             scope
                 .spawn(|| {
                     let data = DeckData::from_path(data_path).map_err(|e| e.to_string())?;
-                    recommend_json(&data, &roster_json, &request_json)
-                        .map_err(|e| e.to_string())
+                    recommend_json(&data, &roster_json, &request_json).map_err(|e| e.to_string())
                 })
                 .join()
                 .map_err(|_| "native search worker panicked".to_owned())?
@@ -604,6 +614,27 @@ pub extern "C" fn ournotes_ffi_version() -> u32 {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn search_pool_admits_requests_up_to_slot_count() {
+        let pool = SearchPool::with_slots(2);
+        let cancel = parallel::Cancellation::default();
+        let first = pool.acquire_cancellable(&cancel).expect("first permit");
+        let second = pool.acquire_cancellable(&cancel).expect("second permit");
+
+        // A third request waits and gives up once cancelled.
+        let waiting = parallel::Cancellation::default();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| pool.acquire_cancellable(&waiting).is_none());
+            std::thread::sleep(Duration::from_millis(60));
+            waiting.cancel();
+            assert!(handle.join().unwrap());
+        });
+
+        drop(first);
+        assert!(pool.acquire_cancellable(&cancel).is_some());
+        drop(second);
+    }
 
     fn take_json(ptr: *mut c_char) -> serde_json::Value {
         assert!(!ptr.is_null());
