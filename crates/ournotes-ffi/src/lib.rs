@@ -239,13 +239,15 @@ fn inspect_local(manifest_path: &str, roster_text: Option<&str>) -> serde_json::
 
 /// Loads deck data, evaluates one recommendation, and returns JSON. The caller frees the result with
 /// [`ournotes_free_string`]. A null return means invalid pointers or a result containing an interior NUL.
+/// # Safety
+/// Each non-null pointer must remain readable, NUL-terminated UTF-8 for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn ournotes_recommend_json(
+pub unsafe extern "C" fn ournotes_recommend_json(
     data_path: *const c_char,
     roster_json: *const c_char,
     request_json: *const c_char,
 ) -> *mut c_char {
-    // SAFETY: the legacy ABI forwards its existing caller pointer contract.
+    // SAFETY: the caller upholds this function's pointer contract, which is the same as the callee's.
     unsafe {
         ournotes_recommend_json_with_threads(data_path, roster_json, request_json, parallel::default_workers() as u32)
     }
@@ -594,8 +596,11 @@ pub unsafe extern "C" fn ournotes_string_len(value: *const c_char) -> usize {
 }
 
 /// Frees a string returned by this library. Passing null is allowed.
+///
+/// # Safety
+/// `value` is null or an unfreed string this library returned.
 #[unsafe(no_mangle)]
-pub extern "C" fn ournotes_free_string(value: *mut c_char) {
+pub unsafe extern "C" fn ournotes_free_string(value: *mut c_char) {
     if !value.is_null() {
         // SAFETY: the ABI caller returns an unmodified allocation from owned(), once.
         unsafe {
@@ -649,7 +654,7 @@ mod tests {
         // SAFETY: each test receives an owned NUL-terminated ABI allocation and
         // copies its bytes before freeing it exactly once.
         let text = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
-        ournotes_free_string(ptr);
+        unsafe { ournotes_free_string(ptr) };
         serde_json::from_str(&text).unwrap()
     }
 
@@ -717,7 +722,7 @@ mod tests {
         let ptr = owned(text.clone());
         // SAFETY: ptr points to a live ABI-owned NUL-terminated allocation.
         assert_eq!(unsafe { ournotes_string_len(ptr) }, text.len());
-        ournotes_free_string(ptr);
+        unsafe { ournotes_free_string(ptr) };
     }
 
     #[test]
