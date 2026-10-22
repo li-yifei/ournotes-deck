@@ -14,6 +14,8 @@ glibc=2.28
 remap="--remap-path-prefix=$HOME=~"
 mkdir -p "$out"
 cd "$root"
+# capabilities.modelCommit may lag the upstream source commit only while the model is unchanged.
+sh "$root/scripts/release/check-model-commit.sh"
 
 RUSTFLAGS="$remap -C link-arg=-Wl,-install_name,@rpath/libournotes_ffi.dylib" cargo build --release -p ournotes-ffi
 cp "$target_dir/release/libournotes_ffi.dylib" "$out/libournotes_ffi-darwin-arm64.dylib"

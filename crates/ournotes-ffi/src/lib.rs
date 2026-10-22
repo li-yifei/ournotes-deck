@@ -45,8 +45,16 @@ mod parallel {
     }
 }
 
-/// Updated with each rebase onto upstream.
+/// The upstream ournotes-deck commit this engine is built from; updated with each rebase onto upstream and
+/// reported as `capabilities.upstreamCommit`.
 const UPSTREAM_COMMIT: &str = include_str!("../UPSTREAM_COMMIT");
+
+/// The upstream commit whose model (ournotes-sim: the simulator and the deck data format) this engine implements,
+/// reported as `capabilities.modelCommit`. Hosts compare it with the model the deck data was built for, so it may
+/// lag [`UPSTREAM_COMMIT`]: a rebase that takes in only search-side changes keeps it, and it moves to
+/// `UPSTREAM_COMMIT` as soon as ournotes-sim or the data format changes. `scripts/release/check-model-commit.sh`
+/// checks that ournotes-sim is identical across both commits and this tree.
+const MODEL_COMMIT: &str = include_str!("../MODEL_COMMIT");
 
 /// Admits a bounded number of concurrent CPU search requests. Each search runs
 /// on a single thread, so the default is one request per available core;
@@ -497,9 +505,10 @@ pub extern "C" fn ournotes_search_threads_json() -> *mut c_char {
 pub extern "C" fn ournotes_capabilities_json() -> *mut c_char {
     guarded_json(|| {
         let mut capabilities = engine::capabilities();
-        // The upstream ournotes-deck commit whose model this engine implements; hosts compare it with the deck
-        // data's model before using the engine.
-        capabilities["modelCommit"] = serde_json::json!(UPSTREAM_COMMIT.trim());
+        // The model this engine implements, which hosts compare with the deck data's before using the engine, and
+        // the upstream source it is built from; see MODEL_COMMIT for why they may differ.
+        capabilities["modelCommit"] = serde_json::json!(MODEL_COMMIT.trim());
+        capabilities["upstreamCommit"] = serde_json::json!(UPSTREAM_COMMIT.trim());
         Ok(capabilities.to_string())
     })
 }
@@ -714,6 +723,42 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    fn full_sha(commit: &str) -> bool {
+        commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    #[test]
+    fn model_commit_is_reported_apart_from_the_upstream_source_commit() {
+        let capabilities = take_json(ournotes_capabilities_json());
+        let model = capabilities["modelCommit"].as_str().expect("modelCommit");
+        let source = capabilities["upstreamCommit"].as_str().expect("upstreamCommit");
+        assert!(full_sha(model), "modelCommit {model:?} is not a full SHA-1");
+        assert!(full_sha(source), "upstreamCommit {source:?} is not a full SHA-1");
+        assert_eq!(model, MODEL_COMMIT.trim());
+        assert_eq!(source, UPSTREAM_COMMIT.trim());
+        // The model stays the 0.0.12 one the bdon.moe site runs while the engine follows upstream's search-only
+        // changes after it; moving the model is a deliberate change for the desktop app, so it is pinned here too.
+        assert_eq!(model, "564b8911208cb1c5e91170a87f0c2deba7efd7a0");
+    }
+
+    /// A modelCommit that lags the source commit is only sound while ournotes-sim is unchanged between them.
+    #[cfg(unix)]
+    #[test]
+    fn model_commit_lags_the_source_commit_only_while_the_model_is_unchanged() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let script = root.join("scripts/release/check-model-commit.sh");
+        let output = match std::process::Command::new("sh").arg(&script).output() {
+            Ok(output) => output,
+            Err(error) => return eprintln!("skipped: cannot run {}: {error}", script.display()),
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match output.status.code() {
+            Some(0) => {}
+            Some(2) => eprintln!("skipped: git history unavailable: {stderr}"),
+            _ => panic!("check-model-commit.sh failed: {stderr}"),
+        }
+    }
+
     #[test]
     fn abi_string_length_is_exact_for_large_utf8_output_and_null() {
         // SAFETY: null is explicitly supported.
@@ -728,7 +773,8 @@ mod tests {
     #[test]
     fn capabilities_dataset_and_transport_errors_are_json() {
         let mut expected = engine::capabilities();
-        expected["modelCommit"] = serde_json::json!(UPSTREAM_COMMIT.trim());
+        expected["modelCommit"] = serde_json::json!(MODEL_COMMIT.trim());
+        expected["upstreamCommit"] = serde_json::json!(UPSTREAM_COMMIT.trim());
         assert_eq!(take_json(ournotes_capabilities_json()), expected);
         let (path, data) = dataset_fixture();
         let path_c = CString::new(path.to_str().unwrap()).unwrap();
