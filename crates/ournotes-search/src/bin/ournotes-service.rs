@@ -65,11 +65,7 @@ fn handle(mut stream: TcpStream, data: Arc<DeckData>) {
     let method = parts.next().unwrap_or_default();
     let path = parts.next().unwrap_or_default();
     let out = match (method, path) {
-        ("GET", "/health") => (
-            "200 OK",
-            json!({"ok":true,"threads":{"min":1,"max":1,"default":1}})
-                .to_string(),
-        ),
+        ("GET", "/health") => ("200 OK", json!({"ok":true,"threads":{"min":1,"max":1,"default":1}}).to_string()),
         ("POST", "/recommend") => match serde_json::from_slice::<Value>(body) {
             Ok(input) => {
                 let roster = input.get("roster").map(Value::to_string);
@@ -85,12 +81,10 @@ fn handle(mut stream: TcpStream, data: Arc<DeckData>) {
                 };
                 match (roster, request, threads) {
                     (_, _, Err(error)) => ("422 Unprocessable Entity", json!({"error":error}).to_string()),
-                    (Some(roster), Some(request), Ok(_)) => {
-                        match engine::recommend_json(&data, &roster, &request) {
-                            Ok(result) => ("200 OK", result),
-                            Err(error) => ("422 Unprocessable Entity", json!({"error":error.to_string()}).to_string()),
-                        }
-                    }
+                    (Some(roster), Some(request), Ok(_)) => match engine::recommend_json(&data, &roster, &request) {
+                        Ok(result) => ("200 OK", result),
+                        Err(error) => ("422 Unprocessable Entity", json!({"error":error.to_string()}).to_string()),
+                    },
                     _ => ("400 Bad Request", json!({"error":"body requires roster and request"}).to_string()),
                 }
             }
