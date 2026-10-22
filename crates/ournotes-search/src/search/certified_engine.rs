@@ -495,7 +495,8 @@ impl Engine<'_, '_> {
     /// Whether a unit of `unit` that runs to its end cannot pass the deadline: false once the request has stopped,
     /// and false when less time is left than the longest such unit took so far. A stopped request starts nothing.
     fn unit_fits(&self, unit: RefinementUnit) -> bool {
-        if self.stop.is_some() {
+        // A host cancellation stops the request as its deadline would, even before an `expired` check records it.
+        if self.stop.is_some() || crate::cancel::requested() {
             return false;
         }
         let Some(deadline) = self.budget.deadline() else { return true };
